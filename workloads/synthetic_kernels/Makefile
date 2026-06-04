@@ -1,9 +1,12 @@
 NVCC ?= /usr/local/cuda/bin/nvcc
+
 CUDA_ARCH ?= sm_70
+OPT_LEVEL ?= -O2
+
 BUILD_DIR ?= build
 
 CPPFLAGS ?= -Iinclude
-NVCCFLAGS ?= -std=c++17 -O2 -arch=$(CUDA_ARCH) -Wno-deprecated-gpu-targets
+NVCCFLAGS ?= -std=c++17 $(OPT_LEVEL) -arch=$(CUDA_ARCH) -Wno-deprecated-gpu-targets
 
 MINING_SRC_DIR := src/mining
 BENIGN_SRC_DIR := src/benign
