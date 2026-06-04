@@ -7,6 +7,7 @@
 #include <climits>
 #include <cerrno>
 #include <cstddef>
+#include <vector>
 #include <cuda_runtime.h>
 
 #include "cuda_check.cuh"
@@ -67,26 +68,34 @@ inline void print_benign_usage(const char* program) {
     std::fprintf(stderr, "usage: %s <runtime_seconds> [--blocks N] [--threads N] [--sync-every N] [--seed N] [--size-mb N] [--size N] [--iterations N] [--nodes N] [--edges N]\n", program);
 }
 
-__global__ void benign_init_u32(uint32_t* data, size_t n, uint32_t seed) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) return;
+inline uint32_t benign_mix_u32(size_t tid, uint32_t seed) {
     uint32_t x = seed ^ static_cast<uint32_t>(tid * 747796405u + 2891336453u);
-    x ^= x >> 16; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
-    data[tid] = x;
+    x ^= x >> 16;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    x *= 3266489917u;
+    x ^= x >> 16;
+    return x;
 }
 
-__global__ void benign_init_float(float* data, size_t n, uint32_t seed) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) return;
-    uint32_t x = seed ^ static_cast<uint32_t>(tid * 1664525u + 1013904223u);
-    data[tid] = static_cast<float>((x & 0xffffu) - 32768) / 32768.0f;
+inline void benign_fill_u32(uint32_t* data, size_t n, uint32_t seed) {
+    for (size_t tid = 0; tid < n; ++tid) {
+        data[tid] = benign_mix_u32(tid, seed);
+    }
 }
 
-__global__ void benign_init_double(double* data, size_t n, uint32_t seed) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) return;
-    uint32_t x = seed ^ static_cast<uint32_t>(tid * 22695477u + 1u);
-    data[tid] = static_cast<double>((x & 0xffffu) - 32768) / 32768.0;
+inline void benign_fill_float(float* data, size_t n, uint32_t seed) {
+    for (size_t tid = 0; tid < n; ++tid) {
+        uint32_t x = seed ^ static_cast<uint32_t>(tid * 1664525u + 1013904223u);
+        data[tid] = static_cast<float>((x & 0xffffu) - 32768) / 32768.0f;
+    }
+}
+
+inline void benign_fill_double(double* data, size_t n, uint32_t seed) {
+    for (size_t tid = 0; tid < n; ++tid) {
+        uint32_t x = seed ^ static_cast<uint32_t>(tid * 22695477u + 1u);
+        data[tid] = static_cast<double>((x & 0xffffu) - 32768) / 32768.0;
+    }
 }
 
 inline void print_benign_summary(const char* category, const char* workload, const BenignOptions& options,

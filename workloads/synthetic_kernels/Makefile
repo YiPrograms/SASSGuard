@@ -1,28 +1,48 @@
 NVCC ?= /usr/local/cuda/bin/nvcc
 CUDA_ARCH ?= sm_70
-BUILD_DIR ?= build/
+BUILD_DIR ?= build
 
 CPPFLAGS ?= -Iinclude
-NVCCFLAGS ?= -std=c++17 -O2 -arch=$(CUDA_ARCH)
+NVCCFLAGS ?= -std=c++17 -O2 -arch=$(CUDA_ARCH) -Wno-deprecated-gpu-targets
 
-SOURCES := $(shell find src/algos -type f -name '*.cu' | sort)
-KERNELS := $(patsubst src/algos/%.cu,$(BUILD_DIR)/%,$(SOURCES))
+MINING_SRC_DIR := src/mining
+BENIGN_SRC_DIR := src/benign
+MINING_BUILD_DIR := $(BUILD_DIR)/mining
+BENIGN_BUILD_DIR := $(BUILD_DIR)/benign
 
-.PHONY: all kernels help manifest clean list
+MINING_SOURCES := $(shell find $(MINING_SRC_DIR) -type f -name '*.cu' | sort)
+BENIGN_SOURCES := $(shell find $(BENIGN_SRC_DIR) -type f -name '*.cu' | sort)
+
+MINING_KERNELS := $(patsubst $(MINING_SRC_DIR)/%.cu,$(MINING_BUILD_DIR)/%,$(MINING_SOURCES))
+BENIGN_KERNELS := $(patsubst $(BENIGN_SRC_DIR)/%.cu,$(BENIGN_BUILD_DIR)/%,$(BENIGN_SOURCES))
+KERNELS := $(MINING_KERNELS) $(BENIGN_KERNELS)
+
+.PHONY: all kernels mining benign help clean list list-mining list-benign
 
 all: kernels
 
-kernels: $(KERNELS)
+kernels: mining benign
 
-$(BUILD_DIR)/%: src/algos/%.cu
+mining: $(MINING_KERNELS)
+
+benign: $(BENIGN_KERNELS)
+
+$(MINING_BUILD_DIR)/%: $(MINING_SRC_DIR)/%.cu
+	@mkdir -p $(@D)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) $< -o $@
+
+$(BENIGN_BUILD_DIR)/%: $(BENIGN_SRC_DIR)/%.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) $< -o $@
 
 help:
 	@echo "Available targets:"
-	@echo "  all, kernels  Build all CUDA mining kernel executables"
-	@echo "  list          Print discovered CUDA kernel sources"
-	@echo "  manifest      Regenerate source manifest"
+	@echo "  all, kernels  Build all CUDA mining and benign kernel executables"
+	@echo "  mining        Build CUDA mining kernel executables"
+	@echo "  benign        Build CUDA benign kernel executables"
+	@echo "  list          Print all discovered CUDA kernel sources"
+	@echo "  list-mining   Print discovered CUDA mining kernel sources"
+	@echo "  list-benign   Print discovered CUDA benign kernel sources"
 	@echo "  clean         Remove build outputs and temporary files"
 	@echo
 	@echo "Variables:"
@@ -31,8 +51,13 @@ help:
 	@echo "  BUILD_DIR=$(BUILD_DIR)"
 
 list:
-	@printf '%s\n' $(SOURCES)
+	@printf '%s\n' $(MINING_SOURCES) $(BENIGN_SOURCES)
+
+list-mining:
+	@printf '%s\n' $(MINING_SOURCES)
+
+list-benign:
+	@printf '%s\n' $(BENIGN_SOURCES)
 
 clean:
-	rm -rf build
-
+	rm -rf $(BUILD_DIR)

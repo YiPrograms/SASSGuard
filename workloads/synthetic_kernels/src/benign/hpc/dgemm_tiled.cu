@@ -35,10 +35,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_checksum, 0, sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(d_output, 0, sizeof(uint32_t) * n));
 
-    int init_blocks = static_cast<int>((span + options.cli.threads - 1) / options.cli.threads);
-    benign_init_u32<<<init_blocks, options.cli.threads>>>(d_input, span, options.cli.seed + 1549107668u);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint32_t> h_input(span);
+    benign_fill_u32(h_input.data(), span, options.cli.seed + 1549107668u);
+    CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), sizeof(uint32_t) * span, cudaMemcpyHostToDevice));
 
     auto start = std::chrono::steady_clock::now();
     auto end_time = start + std::chrono::seconds(options.cli.runtime_seconds);
