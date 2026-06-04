@@ -28,14 +28,14 @@ CXXFLAGS = $(CFLAGS) -std=c++17
 
 LDFLAGS := -shared -ldl -lpthread
 
-OBJS := $(BUILD)/loader.o $(BUILD)/trampolines.o $(BUILD)/libcuda_blob.o $(BUILD)/hook.o
+OBJS := $(BUILD)/loader.o $(BUILD)/trampolines.o $(BUILD)/libcuda_blob.o $(BUILD)/hook.o $(BUILD)/code_registry.o
 
 all: $(TARGET) $(TEST)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-include/cuda_symbols.def include/cuda_trampolines.inc: $(REAL_LIBCUDA)
+include/cuda_symbols.def include/cuda_trampolines.inc: $(REAL_LIBCUDA) hooked_symbols scripts/gen_trampoline_symbols.py
 	$(PYTHON) scripts/gen_trampoline_symbols.py $(REAL_LIBCUDA)
 
 # If libcuda.so.1.real doesn't exist, copy the libcuda.so.1 to libcuda.so.1.real.
@@ -54,6 +54,9 @@ $(BUILD)/trampolines.o: src/trampolines.S include/cuda_trampolines.inc | $(BUILD
 $(BUILD)/hook.o: src/hook.cc include/cuda_symbols.def | $(BUILD)
 	$(CXX) $(CFLAGS) -c src/hook.cc -o $@
 
+$(BUILD)/code_registry.o: src/code_registry.cc include/code_registry.h | $(BUILD)
+	$(CXX) $(CFLAGS) -c src/code_registry.cc -o $@
+
 $(TARGET): $(OBJS)
 	$(CXX) \
 	  -shared \
@@ -66,7 +69,7 @@ $(TARGET): $(OBJS)
 	  -o $(TARGET)
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD)
 	rm -f include/cuda_symbols.def include/cuda_trampolines.inc
 
 install: $(TARGET)
