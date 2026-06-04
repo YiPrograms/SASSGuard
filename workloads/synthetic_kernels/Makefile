@@ -1,6 +1,6 @@
 NVCC ?= /usr/local/cuda/bin/nvcc
 CUDA_ARCH ?= sm_70
-BUILD_DIR ?= build/bin
+BUILD_DIR ?= build/
 
 CPPFLAGS ?= -Iinclude
 NVCCFLAGS ?= -std=c++17 -O2 -arch=$(CUDA_ARCH)
