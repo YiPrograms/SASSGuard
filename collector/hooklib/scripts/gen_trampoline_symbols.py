@@ -5,13 +5,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 4:
-    print(f"Usage: {sys.argv[0]} [libcuda.so.1] [Output cuda_symbols.def] [Output cuda_trampolines.inc]", file=sys.stderr)
+if len(sys.argv) != 2:
+    print(f"Usage: {sys.argv[0]} [Path to libcuda.so.1]", file=sys.stderr)
     sys.exit(1)
 
 real_libcuda = sys.argv[1]
-out_symbols = sys.argv[2]
-out_trampolines = sys.argv[3]
+out_symbols = "include/cuda_symbols.def"
+out_trampolines = "include/cuda_trampolines.inc"
 
 out = subprocess.check_output(
     ["readelf", "-Ws", "--wide", real_libcuda],
@@ -19,6 +19,7 @@ out = subprocess.check_output(
 )
 
 symbols = set()
+hooked_symbols = set(Path("hooked_symbols").read_text().splitlines())
 
 for line in out.splitlines():
     parts = line.split()
@@ -51,7 +52,8 @@ Path(out_symbols).write_text(
 )
 
 Path(out_trampolines).write_text(
-    "".join(f"CUDA_TRAMP {s}\n" for s in symbols)
+    # Only generate trampolines for symbols that are not hooked.
+    "".join(f"CUDA_TRAMP {s}\n" for s in symbols if s not in hooked_symbols)
 )
 
 print(f"Generated for {len(symbols)} CUDA symbols")

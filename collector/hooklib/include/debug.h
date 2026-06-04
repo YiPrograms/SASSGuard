@@ -2,6 +2,12 @@
 #ifndef CUHOOK_DEBUG_H
 #define CUHOOK_DEBUG_H
 
+#ifdef __cplusplus
+#include <cstdio>
+#else
+#include <stdio.h>
+#endif
+
 #define STRINGIFY(x) #x
 #define STR(x) STRINGIFY(x)
 
