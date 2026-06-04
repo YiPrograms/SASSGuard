@@ -10,8 +10,8 @@
 
 #include "debug.h"
 
-extern char _binary__usr_lib_x86_64_linux_gnu_libcuda_real_so_1_start[];
-extern char _binary__usr_lib_x86_64_linux_gnu_libcuda_real_so_1_end[];
+extern char _binary_libcuda_so_1_real_start[];
+extern char _binary_libcuda_so_1_real_end[];
 
 static void *dl_handle = NULL;
 
@@ -58,10 +58,10 @@ static void load_libcuda(void) {
 	}
 
 	size_t size =
-		(size_t)(_binary__usr_lib_x86_64_linux_gnu_libcuda_real_so_1_end -
-			_binary__usr_lib_x86_64_linux_gnu_libcuda_real_so_1_start);
+		(size_t)(_binary_libcuda_so_1_real_end -
+			_binary_libcuda_so_1_real_start);
 
-	if (fwrite(_binary__usr_lib_x86_64_linux_gnu_libcuda_real_so_1_start,
+	if (fwrite(_binary_libcuda_so_1_real_start,
 		1,
 		size,
 		fp) != size) {
@@ -82,19 +82,7 @@ static void load_libcuda(void) {
 
 	DEBUG("Temporary CUDA library created at %s", libcuda_path);
 
-	/*
-	 * RTLD_LOCAL:
-	 *   Keep the real libcuda symbols out of the global namespace.
-	 *
-	 * RTLD_DEEPBIND:
-	 *   Optional glibc flag. It can help prevent the real libcuda from binding
-	 *   its own internal references back to our proxy symbols.
-	 *
-	 * For the first test, try RTLD_NOW | RTLD_LOCAL first.
-	 * If you see recursion or strange binding behavior, add RTLD_DEEPBIND.
-	 */
 	dl_handle = dlopen(libcuda_path, RTLD_NOW | RTLD_LOCAL);
-
 	if (!dl_handle) {
 		INFO("Failed to open embedded CUDA library: %s", dlerror());
 		unlink(libcuda_path);

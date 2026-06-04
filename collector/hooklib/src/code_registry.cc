@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "debug.h"
+#include "telemetry.h"
 
 namespace {
 
@@ -61,8 +62,7 @@ void send_code(const void *code, size_t size, uint32_t code_type,
 
   DEBUG("Captured code (type %u, id %u, size %zu bytes)",
         code_type, code_id, size);
-  (void)code_type;
-  (void)code_id;
+  sg_enqueue_code(code_id, code_type, code, size);
 }
 
 CodeImage load_fatbin_header(const FatbinHeader *fatbin) {
@@ -248,25 +248,43 @@ KernelInfo get_kernel_info(void *kernel_handle) {
 }
 
 void send_kernel_launch(const KernelLaunch &launch) {
-#ifdef CUHOOK_DEBUG
   KernelInfo kernel = get_kernel_info(launch.kernel_handle);
+  SGKernelLaunchEvent event{};
+
+  snprintf(event.kernel_name, sizeof(event.kernel_name), "%s",
+           kernel.found ? kernel.name.c_str() : "");
+  event.kernel_name_found = kernel.found ? 1 : 0;
+  event.code_id = kernel.found ? kernel.code_id : SG_CODE_ID_UNKNOWN;
+  event.code_id_found =
+      kernel.found && kernel.code_id != SG_CODE_ID_UNKNOWN ? 1 : 0;
+  event.kernel_handle =
+      reinterpret_cast<uint64_t>(launch.kernel_handle);
+  event.grid_dim_x = launch.gridDimX;
+  event.grid_dim_y = launch.gridDimY;
+  event.grid_dim_z = launch.gridDimZ;
+  event.block_dim_x = launch.blockDimX;
+  event.block_dim_y = launch.blockDimY;
+  event.block_dim_z = launch.blockDimZ;
+  event.shared_mem_bytes = launch.sharedMemBytes;
+  event.stream_handle = reinterpret_cast<uint64_t>(launch.stream_handle);
+  snprintf(event.device_pci_bus_id, sizeof(event.device_pci_bus_id), "%s",
+           launch.device_pci_bus_id != nullptr ? launch.device_pci_bus_id : "");
 
   if (launch.has_dimensions) {
-    DEBUG("Captured kernel launch %s: kernel %p -> name %s, code ID %u, gridDim (%u, %u, %u), blockDim (%u, %u, %u), sharedMemBytes %u, stream %p, device %s",
-          launch.api_name, launch.kernel_handle,
+    DEBUG("Captured kernel launch: kernel %p -> name %s, code ID %u, gridDim (%u, %u, %u), blockDim (%u, %u, %u), sharedMemBytes %u, stream %p, device %s",
+          launch.kernel_handle,
           kernel.found ? kernel.name.c_str() : "<unknown>",
           kernel.found ? kernel.code_id : UINT32_MAX, launch.gridDimX,
           launch.gridDimY, launch.gridDimZ, launch.blockDimX,
           launch.blockDimY, launch.blockDimZ, launch.sharedMemBytes,
           launch.stream_handle, launch.device_pci_bus_id);
   } else {
-    DEBUG("Captured kernel launch %s: kernel %p -> name %s, code ID %u, config <null>, device %s",
-          launch.api_name, launch.kernel_handle,
+    DEBUG("Captured kernel launch: kernel %p -> name %s, code ID %u, config <null>, device %s",
+          launch.kernel_handle,
           kernel.found ? kernel.name.c_str() : "<unknown>",
           kernel.found ? kernel.code_id : UINT32_MAX,
           launch.device_pci_bus_id);
   }
-#else
-  (void)launch;
-#endif
+
+  sg_enqueue_kernel_launch(&event);
 }

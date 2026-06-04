@@ -77,10 +77,9 @@ CUresult cuLaunchKernel(CUfunction f,
 
   char pci_bus_id[13];
   get_device_pci_bus_id(pci_bus_id, sizeof(pci_bus_id));
-  send_kernel_launch(KernelLaunch{"cuLaunchKernel", f, true, gridDimX,
-                                  gridDimY, gridDimZ, blockDimX, blockDimY,
-                                  blockDimZ, sharedMemBytes, hStream,
-                                  pci_bus_id});
+  send_kernel_launch(KernelLaunch{f, true, gridDimX, gridDimY, gridDimZ,
+                                  blockDimX, blockDimY, blockDimZ,
+                                  sharedMemBytes, hStream, pci_bus_id});
 
 	return real(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
 		sharedMemBytes, hStream, kernelParams, extra);
@@ -96,15 +95,14 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
   get_device_pci_bus_id(pci_bus_id, sizeof(pci_bus_id));
 
   if (config != NULL) {
-    send_kernel_launch(KernelLaunch{"cuLaunchKernelEx", f, true,
-                                    config->gridDimX, config->gridDimY,
+    send_kernel_launch(KernelLaunch{f, true, config->gridDimX, config->gridDimY,
                                     config->gridDimZ, config->blockDimX,
                                     config->blockDimY, config->blockDimZ,
                                     config->sharedMemBytes, config->hStream,
                                     pci_bus_id});
   } else {
-    send_kernel_launch(KernelLaunch{"cuLaunchKernelEx", f, false, 0, 0, 0, 0,
-                                    0, 0, 0, NULL, pci_bus_id});
+    send_kernel_launch(KernelLaunch{f, false, 0, 0, 0, 0, 0, 0, 0, NULL,
+                                    pci_bus_id});
   }
 
   return real(config, f, kernelParams, extra);
@@ -120,8 +118,8 @@ CUresult cuLaunchCooperativeKernel(CUfunction f,
 
   char pci_bus_id[13];
   get_device_pci_bus_id(pci_bus_id, sizeof(pci_bus_id));
-  send_kernel_launch(KernelLaunch{"cuLaunchCooperativeKernel", f, true,
-                                  gridDimX, gridDimY, gridDimZ, blockDimX,
+  send_kernel_launch(KernelLaunch{f, true, gridDimX, gridDimY, gridDimZ,
+                                  blockDimX,
                                   blockDimY, blockDimZ, sharedMemBytes,
                                   hStream, pci_bus_id});
 

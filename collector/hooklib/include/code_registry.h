@@ -11,7 +11,6 @@ struct KernelInfo {
 };
 
 struct KernelLaunch {
-  const char *api_name;
   void *kernel_handle;
   bool has_dimensions;
   unsigned int gridDimX;

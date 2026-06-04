@@ -1,0 +1,4 @@
+.vscode/
+
+# Default output directory for the SassGuard collector server.
+sassguard-data/

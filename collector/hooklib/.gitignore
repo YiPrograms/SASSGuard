@@ -1,4 +1,5 @@
 build
+libcuda.so.1.real
 
 include/cuda_symbols.def
 include/cuda_trampolines.inc
