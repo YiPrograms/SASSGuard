@@ -5,17 +5,17 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cstring>
 #include <cstdlib>
-#include <mutex>
-#include <vector>
+#include <cstring>
+#include <pthread.h>
 
 #include "debug.h"
 
 namespace {
 
-std::mutex ring_mutex;
-std::vector<SGEvent> ring;
+pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
+SGEvent *ring = nullptr;
+size_t ring_capacity = 0;
 size_t ring_head = 0;
 size_t ring_tail = 0;
 size_t ring_count = 0;
@@ -49,26 +49,27 @@ void count_drop(uint64_t bytes) {
 }
 
 int push_event(const SGEvent *event, uint64_t bytes_if_dropped) {
-  if (!ring_initialized || ring.empty()) {
+  if (pthread_mutex_trylock(&ring_mutex) != 0) {
     count_drop(bytes_if_dropped);
     return 0;
   }
 
-  if (!ring_mutex.try_lock()) {
+  if (!ring_initialized || ring == nullptr || ring_capacity == 0) {
+    pthread_mutex_unlock(&ring_mutex);
     count_drop(bytes_if_dropped);
     return 0;
   }
 
-  if (ring_count == ring.size()) {
-    ring_mutex.unlock();
+  if (ring_count == ring_capacity) {
+    pthread_mutex_unlock(&ring_mutex);
     count_drop(bytes_if_dropped);
     return 0;
   }
 
   ring[ring_tail] = *event;
-  ring_tail = (ring_tail + 1) % ring.size();
+  ring_tail = (ring_tail + 1) % ring_capacity;
   ring_count++;
-  ring_mutex.unlock();
+  pthread_mutex_unlock(&ring_mutex);
   return 1;
 }
 
@@ -85,35 +86,46 @@ void release_event(SGEvent *event) {
 extern "C" {
 
 int sg_telemetry_init(uint32_t capacity) {
-  std::lock_guard<std::mutex> lock(ring_mutex);
-  if (ring_initialized) return 1;
+  pthread_mutex_lock(&ring_mutex);
+  if (ring_initialized) {
+    pthread_mutex_unlock(&ring_mutex);
+    return 1;
+  }
   if (capacity == 0) capacity = 1;
 
-  ring.clear();
-  ring.resize(capacity);
+  ring = static_cast<SGEvent *>(calloc(capacity, sizeof(SGEvent)));
+  if (ring == nullptr) {
+    pthread_mutex_unlock(&ring_mutex);
+    return 0;
+  }
+  ring_capacity = capacity;
   ring_head = 0;
   ring_tail = 0;
   ring_count = 0;
   ring_initialized = true;
+  pthread_mutex_unlock(&ring_mutex);
 
   DEBUG("telemetry ring initialized with capacity %u", capacity);
   return 1;
 }
 
 void sg_telemetry_shutdown(void) {
-  std::lock_guard<std::mutex> lock(ring_mutex);
-  if (!ring_initialized) return;
+  pthread_mutex_lock(&ring_mutex);
+  if (!ring_initialized) {
+    pthread_mutex_unlock(&ring_mutex);
+    return;
+  }
 
   for (size_t i = 0; i < ring_count; i++) {
-    size_t idx = (ring_head + i) % ring.size();
+    size_t idx = (ring_head + i) % ring_capacity;
     release_event(&ring[idx]);
   }
 
-  ring.clear();
   ring_head = 0;
   ring_tail = 0;
   ring_count = 0;
   ring_initialized = false;
+  pthread_mutex_unlock(&ring_mutex);
 }
 
 int sg_enqueue_code(uint32_t code_id, uint32_t code_type, const void *data,
@@ -154,16 +166,21 @@ int sg_enqueue_kernel_launch(const SGKernelLaunchEvent *launch) {
 size_t sg_ring_pop_batch(SGEvent *out, size_t max_events) {
   if (out == nullptr || max_events == 0) return 0;
 
-  std::lock_guard<std::mutex> lock(ring_mutex);
-  if (!ring_initialized || ring_count == 0) return 0;
+  pthread_mutex_lock(&ring_mutex);
+  if (!ring_initialized || ring == nullptr || ring_capacity == 0 ||
+      ring_count == 0) {
+    pthread_mutex_unlock(&ring_mutex);
+    return 0;
+  }
 
   size_t n = ring_count < max_events ? ring_count : max_events;
   for (size_t i = 0; i < n; i++) {
     out[i] = ring[ring_head];
     ring[ring_head] = SGEvent{};
-    ring_head = (ring_head + 1) % ring.size();
+    ring_head = (ring_head + 1) % ring_capacity;
   }
   ring_count -= n;
+  pthread_mutex_unlock(&ring_mutex);
   return n;
 }
 
@@ -180,8 +197,9 @@ void sg_ring_stats(SGTelemetryStats *stats) {
   stats->dropped_events = dropped_events.load(std::memory_order_relaxed);
   stats->dropped_bytes = dropped_bytes.load(std::memory_order_relaxed);
 
-  std::lock_guard<std::mutex> lock(ring_mutex);
+  pthread_mutex_lock(&ring_mutex);
   stats->queued_events = ring_count;
+  pthread_mutex_unlock(&ring_mutex);
 }
 
 }  // extern "C"

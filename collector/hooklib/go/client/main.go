@@ -78,10 +78,7 @@ func sg_go_stop() {
 	runtimeState.mu.Unlock()
 
 	close(stop)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
+	<-done
 }
 
 func main() {}
