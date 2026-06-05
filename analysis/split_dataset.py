@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Create grouped train/validation/test split manifests for ModernBERT classification."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from sassguard_analysis.splits import (
+    DEFAULT_RATIOS,
+    SplitError,
+    load_workload_records,
+    make_grouped_stratified_split,
+    validate_splits,
+    write_splits,
+)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-dir", type=Path, default=Path("dataset"))
+    parser.add_argument("--output-dir", type=Path, default=Path("dataset/splits"))
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--train-ratio", type=float, default=DEFAULT_RATIOS["train"])
+    parser.add_argument("--val-ratio", type=float, default=DEFAULT_RATIOS["val"])
+    parser.add_argument("--test-ratio", type=float, default=DEFAULT_RATIOS["test"])
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    ratios = {"train": args.train_ratio, "val": args.val_ratio, "test": args.test_ratio}
+    try:
+        records = load_workload_records(args.dataset_dir / "workloads", dataset_root=args.dataset_dir)
+        splits = make_grouped_stratified_split(records, seed=args.seed, ratios=ratios)
+        warnings = validate_splits(splits, records)
+        manifest = write_splits(args.output_dir, splits, records, args.seed, ratios, warnings)
+    except SplitError as exc:
+        print(f"[FATAL] {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Wrote splits to {args.output_dir}")
+    for split_name, summary in manifest["splits"].items():
+        print(
+            f"{split_name}: {summary['examples']} examples, "
+            f"{summary['groups']} groups, labels={summary['labels']}, opts={summary['opt_levels']}"
+        )
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
