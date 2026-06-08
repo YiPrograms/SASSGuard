@@ -45,10 +45,16 @@ def split_launched_kernels(
     missing: list[dict[str, Any]] = []
     used_dirs: set[str] = set()
     dir_counts: Counter[str] = Counter()
+    reusable_kernel_dirs: dict[tuple[str, str], Path] = {}
 
     for (kernel_name, code_id), launch in first_seen.items():
         if not kernel_name:
             missing.append({"kernel_name": kernel_name, "code_id": code_id, "reason": "missing name"})
+            continue
+        source = code_map[str(code_id)]["dump_path"] if str(code_id) in code_map else ""
+        reusable_key = (str(kernel_name), source)
+        if reusable_key in reusable_kernel_dirs:
+            kernel_dirs[(str(kernel_name), code_id)] = reusable_kernel_dirs[reusable_key]
             continue
         functions = functions_by_code.get(str(code_id), {})
         instructions = functions.get(str(kernel_name))
@@ -73,7 +79,6 @@ def split_launched_kernels(
         out_dir.mkdir(parents=True, exist_ok=True)
         kernel_sass = render_kernel_sass(instructions)
         (out_dir / "kernel.sass").write_text(kernel_sass, encoding="utf-8")
-        source = code_map[str(code_id)]["dump_path"] if str(code_id) in code_map else None
         metadata = {
             "kernel_name": kernel_name,
             "disassembly_function": matched_function,
@@ -87,6 +92,7 @@ def split_launched_kernels(
         }
         write_json(out_dir / "metadata.json", metadata)
         kernel_dirs[(str(kernel_name), code_id)] = out_dir
+        reusable_kernel_dirs[reusable_key] = out_dir
 
     return kernel_dirs, missing
 
@@ -244,12 +250,19 @@ def _parse_ok_disassemblies(
     extraction_report: dict[str, Any],
 ) -> dict[str, dict[str, list[SASSInstruction]]]:
     parsed: dict[str, dict[str, list[SASSInstruction]]] = {}
+    parsed_by_output: dict[str, dict[str, list[SASSInstruction]]] = {}
     for item in extraction_report.get("code_objects", []):
         if item.get("status") != "ok":
             continue
-        path = workload_dir / item["disassembly_output"]
+        output = str(item["disassembly_output"])
+        if output in parsed_by_output:
+            parsed[str(item["code_id"])] = parsed_by_output[output]
+            continue
+        path = workload_dir / output
         if path.exists():
-            parsed[str(item["code_id"])] = parse_disassembly(path.read_text(encoding="utf-8"))
+            functions = parse_disassembly(path.read_text(encoding="utf-8"))
+            parsed_by_output[output] = functions
+            parsed[str(item["code_id"])] = functions
     return parsed
 
 

@@ -29,25 +29,86 @@ def load_workload_records(workloads_dir: Path, dataset_root: Path | None = None)
     records: list[dict[str, Any]] = []
     for manifest_path in sorted(workloads_dir.glob("*/manifest.json")):
         workload_dir = manifest_path.parent
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        window_manifest = workload_dir / "windows" / "manifests.jsonl"
+        if window_manifest.exists():
+            records.extend(load_window_records(workload_dir, window_manifest, manifest, dataset_root))
+            continue
+
         workload_sass = workload_dir / "workload.sass"
         if not workload_sass.exists():
-            raise SplitError(f"missing workload.sass for {workload_dir.name}")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        workload = str(manifest["workload"])
-        records.append(
-            {
-                "workload": workload,
-                "path": _display_path(workload_sass, dataset_root),
-                "label": str(manifest["label"]),
-                "binary_label": "mining" if manifest["label"] == "mining_like" else "benign",
-                "family": str(manifest["family"]),
-                "opt_level": str(manifest["opt_level"]),
-                "group_id": group_id_for_workload(workload),
-            }
-        )
+            raise SplitError(f"missing workload.sass or windows/manifests.jsonl for {workload_dir.name}")
+        records.append(record_from_manifest(manifest, workload_sass, dataset_root))
     if not records:
         raise SplitError(f"no workload manifests found in {workloads_dir}")
     return records
+
+
+def load_window_records(
+    workload_dir: Path,
+    window_manifest: Path,
+    parent_manifest: dict[str, Any],
+    dataset_root: Path,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with window_manifest.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            missing = [key for key in ("workload", "path", "label", "family", "opt_level") if key not in row]
+            if missing:
+                raise SplitError(f"{window_manifest}:{line_no} missing fields: {', '.join(missing)}")
+            sass_path = workload_dir / str(row["path"])
+            if not sass_path.exists():
+                raise SplitError(f"{window_manifest}:{line_no} missing window SASS: {sass_path}")
+            record = {
+                "workload": str(row["workload"]),
+                "path": _display_path(sass_path, dataset_root),
+                "label": str(row["label"]),
+                "binary_label": str(row.get("binary_label") or ("mining" if row["label"] == "mining_like" else "benign")),
+                "family": str(row["family"]),
+                "opt_level": str(row["opt_level"]),
+                "group_id": str(row.get("group_id") or row.get("parent_workload") or parent_manifest.get("capture_id") or parent_manifest["workload"]),
+            }
+            for key in (
+                "parent_workload",
+                "capture_id",
+                "window_id",
+                "window_type",
+                "l0_group_kind",
+                "l0_group_key",
+                "program",
+                "variant",
+                "source_capture_path",
+            ):
+                if key in row:
+                    record[key] = row[key]
+            rows.append(record)
+    if not rows:
+        raise SplitError(f"{window_manifest} has no window rows")
+    return rows
+
+
+def record_from_manifest(
+    manifest: dict[str, Any],
+    workload_sass: Path,
+    dataset_root: Path,
+) -> dict[str, Any]:
+    workload = str(manifest["workload"])
+    record = {
+        "workload": workload,
+        "path": _display_path(workload_sass, dataset_root),
+        "label": str(manifest["label"]),
+        "binary_label": "mining" if manifest["label"] == "mining_like" else "benign",
+        "family": str(manifest["family"]),
+        "opt_level": str(manifest["opt_level"]),
+        "group_id": str(manifest.get("parent_workload") or manifest.get("capture_id") or group_id_for_workload(workload)),
+    }
+    for key in ("parent_workload", "capture_id", "window_id", "window_type", "l0_group_key"):
+        if key in manifest:
+            record[key] = manifest[key]
+    return record
 
 
 def group_id_for_workload(workload: str) -> str:

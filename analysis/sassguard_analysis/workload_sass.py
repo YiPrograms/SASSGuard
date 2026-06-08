@@ -19,14 +19,50 @@ def build_workload_sass(
     short_kernel_threshold: int = 256,
 ) -> dict[str, Any]:
     launches = read_jsonl(workload_dir / "launches.jsonl", limit=max_launches)
+    result = render_workload_sass(
+        workload_dir,
+        launches,
+        short_kernel_threshold=short_kernel_threshold,
+    )
+    (workload_dir / "workload.sass").write_text(result["text"], encoding="utf-8")
+    return {"included_launches": result["included_launches"], "missing_launches": result["missing_launches"]}
+
+
+def render_workload_sass(
+    workload_dir: Path,
+    launches: list[dict[str, Any]],
+    short_kernel_threshold: int = 256,
+) -> dict[str, Any]:
+    fragments = render_workload_sass_fragments(
+        workload_dir,
+        launches,
+        short_kernel_threshold=short_kernel_threshold,
+    )
+    output_lines: list[str] = []
+    for fragment in fragments["fragments"]:
+        output_lines.extend(fragment["lines"])
+    if not output_lines:
+        raise WorkloadSassError("no launched kernel could be mapped to normalized SASS")
+
+    return {
+        "text": "\n".join(output_lines).rstrip() + "\n",
+        "included_launches": len(fragments["fragments"]),
+        "missing_launches": fragments["missing_launches"],
+    }
+
+
+def render_workload_sass_fragments(
+    workload_dir: Path,
+    launches: list[dict[str, Any]],
+    short_kernel_threshold: int = 256,
+) -> dict[str, Any]:
     kernel_dirs = load_kernel_metadata(workload_dir / "kernels")
     by_name: dict[str, Path] = {}
     for (kernel_name, _code_id), path in kernel_dirs.items():
         by_name.setdefault(kernel_name, path)
 
-    output_lines: list[str] = []
+    fragments: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
-    included = 0
     for launch in launches:
         key = (launch.get("kernel_name"), launch.get("code_id"))
         kernel_dir = kernel_dirs.get(key) or by_name.get(str(launch.get("kernel_name")))
@@ -53,15 +89,12 @@ def build_workload_sass(
             )
             continue
         chosen = kernel_lines if count_instruction_lines(kernel_lines) <= short_kernel_threshold else main_loop_lines
-        output_lines.extend(chosen)
-        output_lines.append("KERNEL_BOUNDARY")
-        included += 1
+        fragments.append({"launch": launch, "lines": [*chosen, "KERNEL_BOUNDARY"]})
 
-    if included == 0:
+    if not fragments:
         raise WorkloadSassError("no launched kernel could be mapped to normalized SASS")
 
-    (workload_dir / "workload.sass").write_text("\n".join(output_lines).rstrip() + "\n", encoding="utf-8")
-    return {"included_launches": included, "missing_launches": missing}
+    return {"fragments": fragments, "missing_launches": missing}
 
 
 def _read_nonempty(path: Path) -> list[str]:

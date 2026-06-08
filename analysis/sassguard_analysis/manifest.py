@@ -59,6 +59,10 @@ def workload_manifest(workload_name: str, entry: dict[str, str]) -> dict[str, st
         "capture_id",
         "source_capture_path",
         "binary_label",
+        "parent_workload",
+        "window_id",
+        "window_type",
+        "l0_group_key",
     ):
         if key in entry:
             manifest[key] = entry[key]

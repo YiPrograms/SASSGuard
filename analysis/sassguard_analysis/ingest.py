@@ -102,6 +102,7 @@ def copy_code_objects(
     dumps_dir = workload_dir / "dumps"
     dumps_dir.mkdir(parents=True, exist_ok=True)
     code_map: dict[str, dict[str, Any]] = {}
+    copied_by_sha: dict[str, dict[str, Any]] = {}
     capture_root = capture_dir.resolve()
 
     for event in code_events:
@@ -118,13 +119,24 @@ def copy_code_objects(
             raise IngestError(f"code event path escapes capture directory: {rel}")
 
         dst = dumps_dir / src.name
-        digest, size = copy_with_sha256(src, dst)
         expected_sha = event.get("sha256")
+        expected_size = event.get("size")
+        duplicate = copied_by_sha.get(str(expected_sha).lower()) if expected_sha else None
+        if duplicate is not None:
+            if expected_size is not None and int(expected_size) != int(duplicate["size"]):
+                raise IngestError(
+                    f"size mismatch for duplicate {rel}: expected {expected_size}, got {duplicate['size']}"
+                )
+            digest = str(duplicate["sha256"])
+            size = int(duplicate["size"])
+            dump_path = str(duplicate["dump_path"])
+        else:
+            digest, size = copy_with_sha256(src, dst)
+            dump_path = f"dumps/{src.name}"
         if expected_sha and str(expected_sha).lower() != digest:
             raise IngestError(
                 f"sha256 mismatch for {rel}: expected {expected_sha}, got {digest}"
             )
-        expected_size = event.get("size")
         if expected_size is not None and int(expected_size) != size:
             raise IngestError(f"size mismatch for {rel}: expected {expected_size}, got {size}")
 
@@ -133,10 +145,22 @@ def copy_code_objects(
             "code_id": event["code_id"],
             "code_type": event.get("code_type"),
             "source_path": str(rel),
-            "dump_path": f"dumps/{src.name}",
+            "dump_path": dump_path,
             "sha256": digest,
             "size": size,
         }
+        if duplicate is not None:
+            code_map[code_id]["deduplicated_dump_from"] = str(duplicate["code_id"])
+        copied_by_sha.setdefault(
+            digest,
+            {
+                "code_id": event["code_id"],
+                "dump_abs_path": str(dst),
+                "dump_path": dump_path,
+                "sha256": digest,
+                "size": size,
+            },
+        )
 
     write_json(dumps_dir / "code_map.json", code_map)
     return code_map

@@ -10,12 +10,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sassguard_analysis.cfg import build_cfg
-from sassguard_analysis.disassemble import detect_code_format
-from sassguard_analysis.ingest import event_sort_key, write_launches
+from sassguard_analysis.disassemble import detect_code_format, disassemble_code_objects
+from sassguard_analysis.ingest import copy_code_objects, event_sort_key, write_launches
+from sassguard_analysis.l0_config import L0ConfigError, load_l0_config, parse_l0_config
+from sassguard_analysis.l0_windows import build_l0_windows, launch_features, proportional_condense_launches
 from sassguard_analysis.loop_extract import extract_main_loop
 from build_dataset import (
     capture_spec_has_no_kernel_launch,
     load_capture_manifest_specs,
+    parse_args,
 )
 from sassguard_analysis.manifest import load_binary_manifest, workload_manifest
 from sassguard_analysis.normalize import normalize_instruction, normalize_sass
@@ -26,10 +29,12 @@ from sassguard_analysis.splits import (
 )
 from sassguard_analysis.split_kernels import (
     SASSInstruction,
+    _parse_ok_disassemblies,
     parse_disassembly,
     render_kernel_sass,
     safe_kernel_dir,
     select_fallback_function,
+    split_launched_kernels,
     unique_safe_kernel_dir,
 )
 from sassguard_analysis.workload_sass import build_workload_sass
@@ -170,6 +175,133 @@ class IngestTests(unittest.TestCase):
             row = json.loads((workload_dir / "launches.jsonl").read_text(encoding="utf-8"))
             self.assertEqual(row["kernel_name"], "k")
 
+    def test_copy_code_objects_reuses_duplicate_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = root / "capture"
+            code_dir = capture / "code"
+            workload = root / "workload"
+            code_dir.mkdir(parents=True)
+            payload = b"duplicate-code-object"
+            (code_dir / "a.bin").write_bytes(payload)
+            (code_dir / "b.bin").write_bytes(payload)
+            import hashlib
+
+            digest = hashlib.sha256(payload).hexdigest()
+            code_map = copy_code_objects(
+                capture,
+                [
+                    {"code_id": 0, "path": "code/a.bin", "sha256": digest, "size": len(payload)},
+                    {"code_id": 1, "path": "code/b.bin", "sha256": digest, "size": len(payload)},
+                ],
+                workload,
+            )
+            self.assertEqual(code_map["1"]["deduplicated_dump_from"], "0")
+            self.assertEqual(code_map["0"]["sha256"], code_map["1"]["sha256"])
+            self.assertEqual(code_map["0"]["dump_path"], code_map["1"]["dump_path"])
+            self.assertEqual(len(list((workload / "dumps").glob("*.bin"))), 1)
+
+
+class L0ConfigTests(unittest.TestCase):
+    def test_default_l0_config_loads(self) -> None:
+        config = load_l0_config()
+        self.assertTrue(config.enabled)
+        self.assertFalse(config.grouping.emit_process_aggregate_windows)
+        self.assertEqual(config.short_window.max_launches, 256)
+        self.assertEqual(config.long_window.target_l1_chunks, 12)
+        self.assertEqual(config.long_window.max_emitted_launches, 256)
+        self.assertEqual(config.trigger.cooldown_ms, 10000)
+
+    def test_l0_config_requires_sections(self) -> None:
+        with self.assertRaisesRegex(L0ConfigError, "missing sections"):
+            parse_l0_config({"enabled": True})
+
+    def test_l0_config_rejects_invalid_thresholds(self) -> None:
+        raw = {
+            "enabled": True,
+            "grouping": {
+                "emit_stream_windows": True,
+                "emit_process_aggregate_windows": True,
+                "include_tid_in_group": False,
+            },
+            "maturity": {"min_launches": 0, "min_duration_ms": 1000, "long_min_duration_ms": 30000},
+            "short_window": {"duration_ms": 5000, "max_launches": 256, "target_l1_chunks": 4},
+            "long_window": {"duration_ms": 60000, "max_launches": 2048, "target_l1_chunks": 8, "max_emitted_launches": 64},
+            "repetition": {
+                "dominant_code_id_ratio": 0.7,
+                "top3_code_id_ratio": 0.85,
+                "normalized_entropy": 0.45,
+            },
+            "trigger": {
+                "stable_shape_min_launches": 64,
+                "grid_stability": 0.8,
+                "block_stability": 0.8,
+                "cooldown_ms": 10000,
+                "major_change_min_interval_ms": 5000,
+                "periodic_sample_ms": 30000,
+                "entropy_shift": 0.35,
+                "top3_jaccard_threshold": 0.34,
+                "shape_change_min_stability": 0.8,
+            },
+            "condensation": {"enabled": True, "preserve_first_last": True, "min_per_code_id": 1},
+        }
+        with self.assertRaisesRegex(L0ConfigError, "min_launches"):
+            parse_l0_config(raw)
+
+    def test_no_l0_windowing_cli_override_is_available(self) -> None:
+        args = parse_args(["--no-l0-windowing"])
+        self.assertFalse(args.l0_windowing)
+
+
+class L0WindowTests(unittest.TestCase):
+    def test_l0_groups_by_stream_without_tid(self) -> None:
+        config = parse_l0_config(_l0_test_config(min_launches=2, short_duration_ms=1000, long_duration_ms=2000))
+        launches = [
+            _launch(seq=0, tid=10, stream=1, code_id=0),
+            _launch(seq=1, tid=11, stream=1, code_id=0),
+            _launch(seq=2, tid=12, stream=2, code_id=1),
+            _launch(seq=3, tid=13, stream=2, code_id=1),
+        ]
+        windows = build_l0_windows(launches, config)
+        stream_windows = [window for window in windows if window.group_kind == "stream" and window.window_type == "short"]
+        process_windows = [window for window in windows if window.group_kind == "process" and window.window_type == "short"]
+        self.assertEqual(len(stream_windows), 2)
+        self.assertEqual(len(process_windows), 0)
+        self.assertNotIn("tid", stream_windows[0].group_key)
+
+    def test_l0_features_capture_repetition(self) -> None:
+        features = launch_features(
+            [
+                _launch(seq=0, code_id=0, grid=[1, 1, 1], block=[128, 1, 1]),
+                _launch(seq=1, code_id=0, grid=[1, 1, 1], block=[128, 1, 1]),
+                _launch(seq=2, code_id=1, grid=[2, 1, 1], block=[128, 1, 1]),
+                _launch(seq=3, code_id=0, grid=[1, 1, 1], block=[128, 1, 1]),
+            ]
+        )
+        self.assertEqual(features["launch_count"], 4)
+        self.assertEqual(features["unique_code_id_count"], 2)
+        self.assertAlmostEqual(features["dominant_code_id_ratio"], 0.75)
+        self.assertAlmostEqual(features["grid_stability"], 0.75)
+        self.assertAlmostEqual(features["block_stability"], 1.0)
+
+    def test_l0_long_condensation_is_proportional(self) -> None:
+        launches = [_launch(seq=seq, code_id=0 if seq < 12 else 1) for seq in range(18)]
+        selected, report = proportional_condense_launches(launches, 6)
+        sequences = [launch["sequence"] for launch in selected]
+        self.assertTrue(report["applied"])
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(sequences), 6)
+        self.assertEqual([launch["code_id"] for launch in selected].count(0), 4)
+        self.assertEqual([launch["code_id"] for launch in selected].count(1), 2)
+
+    def test_l0_max_launches_rolls_without_trigger(self) -> None:
+        raw = _l0_test_config(min_launches=100, short_duration_ms=100000, long_duration_ms=200000)
+        raw["short_window"]["max_launches"] = 4  # type: ignore[index]
+        config = parse_l0_config(raw)
+        launches = [_launch(seq=seq, code_id=seq % 2) for seq in range(10)]
+        windows = [window for window in build_l0_windows(launches, config) if window.window_type == "short"]
+        self.assertEqual(windows, [])
+
 
 class DisassemblyTests(unittest.TestCase):
     def test_detect_fatbin_magic(self) -> None:
@@ -177,6 +309,39 @@ class DisassemblyTests(unittest.TestCase):
             path = Path(tmp) / "code.bin"
             path.write_bytes(bytes.fromhex("50ed55ba01001000"))
             self.assertEqual(detect_code_format(path), "fatbin")
+
+    def test_disassembly_reuses_duplicate_code_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dumps = root / "dumps"
+            dumps.mkdir()
+            cubin = dumps / "code_0.bin"
+            cubin.write_bytes(b"\x7fELF" + b"\x00" * 32)
+            duplicate = dumps / "code_1.bin"
+            duplicate.write_bytes(cubin.read_bytes())
+            tool = root / "fake_nvdisasm.py"
+            tool.write_text(
+                "#!/usr/bin/env python3\n"
+                "print('.type kernel,@function')\n"
+                "print('kernel:')\n"
+                "print('        /*0000*/ MOV R1, R2 ;')\n",
+                encoding="utf-8",
+            )
+            tool.chmod(0o755)
+            report = disassemble_code_objects(
+                root,
+                {
+                    "0": {"code_id": 0, "dump_path": "dumps/code_0.bin", "sha256": "same"},
+                    "1": {"code_id": 1, "dump_path": "dumps/code_1.bin", "sha256": "same"},
+                },
+                tools={"nvdisasm": tool},
+            )
+            self.assertEqual(report["deduplicated_code_objects"], 1)
+            self.assertEqual(report["code_objects"][1]["deduplicated_from_code_id"], 0)
+            self.assertEqual(
+                report["code_objects"][1]["disassembly_output"],
+                report["code_objects"][0]["disassembly_output"],
+            )
 
     def test_parse_and_render_cuobjdump_function(self) -> None:
         text = """
@@ -189,6 +354,62 @@ Fatbin elf code:
         rendered = render_kernel_sass(parsed["_Z6kernelv"])
         self.assertIn("L_0:", rendered)
         self.assertIn("@!P0 BRA L_0", rendered)
+
+    def test_parse_ok_disassemblies_reuses_shared_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dumps = root / "dumps"
+            dumps.mkdir()
+            (dumps / "code_0.nvdisasm.txt").write_text(
+                ".type kernel,@function\n"
+                "kernel:\n"
+                "        /*0000*/ MOV R1, R2 ;\n",
+                encoding="utf-8",
+            )
+            parsed = _parse_ok_disassemblies(
+                root,
+                {
+                    "code_objects": [
+                        {"code_id": 0, "status": "ok", "disassembly_output": "dumps/code_0.nvdisasm.txt"},
+                        {"code_id": 1, "status": "ok", "disassembly_output": "dumps/code_0.nvdisasm.txt"},
+                    ]
+                },
+            )
+            self.assertIs(parsed["0"], parsed["1"])
+
+    def test_split_launched_kernels_reuses_duplicate_code_dump_kernel_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dumps = root / "dumps"
+            dumps.mkdir()
+            (dumps / "code_0.nvdisasm.txt").write_text(
+                ".type kernel,@function\n"
+                "kernel:\n"
+                "        /*0000*/ MOV R1, R2 ;\n",
+                encoding="utf-8",
+            )
+            code_map = {
+                "0": {"dump_path": "dumps/code.bin"},
+                "1": {"dump_path": "dumps/code.bin", "deduplicated_dump_from": "0"},
+            }
+            report = {
+                "code_objects": [
+                    {"code_id": 0, "status": "ok", "disassembly_output": "dumps/code_0.nvdisasm.txt"},
+                    {"code_id": 1, "status": "ok", "disassembly_output": "dumps/code_0.nvdisasm.txt"},
+                ]
+            }
+            kernel_dirs, missing = split_launched_kernels(
+                root,
+                [
+                    {"kernel_name": "kernel", "code_id": 0},
+                    {"kernel_name": "kernel", "code_id": 1},
+                ],
+                code_map,
+                report,
+            )
+            self.assertEqual(missing, [])
+            self.assertEqual(kernel_dirs[("kernel", 0)], kernel_dirs[("kernel", 1)])
+            self.assertEqual(len(list((root / "kernels").glob("*/metadata.json"))), 1)
 
     def test_parse_nvdisasm_type_function(self) -> None:
         text = """
@@ -408,6 +629,125 @@ class SplitTests(unittest.TestCase):
             self.assertEqual(labels_in_split, set(labels))
             opts = [record["opt_level"] for record in split_records]
             self.assertEqual(opts.count("O2"), opts.count("O3"))
+
+    def test_load_workload_records_reads_l0_window_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workload_dir = root / "dataset" / "workloads" / "demo"
+            windows_dir = workload_dir / "windows"
+            windows_dir.mkdir(parents=True)
+            (workload_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "workload": "demo",
+                        "family": "hpc",
+                        "label": "benign_compute_like",
+                        "opt_level": "capture",
+                        "capture_id": "cap",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (windows_dir / "w0000_short_stream.sass").write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+            (windows_dir / "manifests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "workload": "demo__w0000_short_stream",
+                        "path": "windows/w0000_short_stream.sass",
+                        "label": "benign_compute_like",
+                        "binary_label": "benign",
+                        "family": "hpc",
+                        "opt_level": "capture",
+                        "parent_workload": "demo",
+                        "capture_id": "cap",
+                        "window_id": "w0000_short_stream",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            from sassguard_analysis.splits import load_workload_records
+
+            records = load_workload_records(root / "dataset" / "workloads", root / "dataset")
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["workload"], "demo__w0000_short_stream")
+            self.assertEqual(records[0]["group_id"], "demo")
+            self.assertEqual(records[0]["path"], "dataset/workloads/demo/windows/w0000_short_stream.sass")
+
+
+def _l0_test_config(
+    min_launches: int = 32,
+    short_duration_ms: int = 5000,
+    long_duration_ms: int = 60000,
+) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "grouping": {
+            "emit_stream_windows": True,
+            "emit_process_aggregate_windows": False,
+            "include_tid_in_group": False,
+        },
+        "maturity": {
+            "min_launches": min_launches,
+            "min_duration_ms": 1000,
+            "long_min_duration_ms": 30000,
+        },
+        "short_window": {
+            "duration_ms": short_duration_ms,
+            "max_launches": 256,
+            "target_l1_chunks": 4,
+        },
+        "long_window": {
+            "duration_ms": long_duration_ms,
+            "max_launches": 2048,
+            "target_l1_chunks": 8,
+            "max_emitted_launches": 64,
+        },
+        "repetition": {
+            "dominant_code_id_ratio": 0.70,
+            "top3_code_id_ratio": 0.85,
+            "normalized_entropy": 0.45,
+        },
+        "trigger": {
+            "stable_shape_min_launches": 64,
+            "grid_stability": 0.80,
+            "block_stability": 0.80,
+            "cooldown_ms": 10000,
+            "major_change_min_interval_ms": 5000,
+            "periodic_sample_ms": 30000,
+            "entropy_shift": 0.35,
+            "top3_jaccard_threshold": 0.34,
+            "shape_change_min_stability": 0.8,
+        },
+        "condensation": {
+            "enabled": True,
+            "preserve_first_last": True,
+            "min_per_code_id": 1,
+        },
+    }
+
+
+def _launch(
+    seq: int,
+    tid: int = 1,
+    stream: int = 0,
+    code_id: int = 0,
+    grid: list[int] | None = None,
+    block: list[int] | None = None,
+) -> dict[str, object]:
+    return {
+        "sequence": seq,
+        "timestamp_ns": seq * 1_000_000,
+        "pid": 123,
+        "tid": tid,
+        "code_id": code_id,
+        "kernel_name": f"k{code_id}",
+        "grid_dim": grid or [1, 1, 1],
+        "block_dim": block or [128, 1, 1],
+        "shared_mem_bytes": 0,
+        "stream": stream,
+        "device_pci_bus_id": "0000:52:00.0",
+    }
 
 
 if __name__ == "__main__":
