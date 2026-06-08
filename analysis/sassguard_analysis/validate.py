@@ -27,8 +27,12 @@ def validate_workload(workload_dir: Path, max_launches: int) -> dict[str, Any]:
         raise ValidationError(f"missing required files: {', '.join(missing)}")
 
     manifest = json.loads((workload_dir / "manifest.json").read_text(encoding="utf-8"))
-    if sorted(manifest) != ["family", "label", "opt_level", "workload"]:
-        raise ValidationError("manifest.json contains unexpected fields")
+    required_manifest_fields = {"family", "label", "opt_level", "workload"}
+    missing_manifest_fields = required_manifest_fields - set(manifest)
+    if missing_manifest_fields:
+        raise ValidationError(
+            f"manifest.json missing fields: {', '.join(sorted(missing_manifest_fields))}"
+        )
 
     launches = read_jsonl(workload_dir / "launches.jsonl", limit=max_launches + 1)
     capped_launch_count = min(len(launches), max_launches)

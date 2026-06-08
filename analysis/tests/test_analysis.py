@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -12,6 +13,10 @@ from sassguard_analysis.cfg import build_cfg
 from sassguard_analysis.disassemble import detect_code_format
 from sassguard_analysis.ingest import event_sort_key, write_launches
 from sassguard_analysis.loop_extract import extract_main_loop
+from build_dataset import (
+    capture_spec_has_no_kernel_launch,
+    load_capture_manifest_specs,
+)
 from sassguard_analysis.manifest import load_binary_manifest, workload_manifest
 from sassguard_analysis.normalize import normalize_instruction, normalize_sass
 from sassguard_analysis.splits import (
@@ -19,7 +24,14 @@ from sassguard_analysis.splits import (
     make_grouped_stratified_split,
     validate_splits,
 )
-from sassguard_analysis.split_kernels import parse_disassembly, render_kernel_sass, safe_kernel_dir
+from sassguard_analysis.split_kernels import (
+    SASSInstruction,
+    parse_disassembly,
+    render_kernel_sass,
+    safe_kernel_dir,
+    select_fallback_function,
+    unique_safe_kernel_dir,
+)
 from sassguard_analysis.workload_sass import build_workload_sass
 
 
@@ -41,6 +53,83 @@ class ManifestTests(unittest.TestCase):
                     "opt_level": "O2",
                 },
             )
+
+    def test_workload_manifest_keeps_capture_provenance(self) -> None:
+        self.assertEqual(
+            workload_manifest(
+                "miner_algo",
+                {
+                    "family": "equihash_solver",
+                    "label": "mining_like",
+                    "opt_level": "capture",
+                    "program": "miner",
+                    "variant": "algo",
+                    "capture_id": "abc",
+                    "source_capture_path": "captures/abc",
+                    "binary_label": "mining",
+                },
+            ),
+            {
+                "workload": "miner_algo",
+                "family": "equihash_solver",
+                "label": "mining_like",
+                "opt_level": "capture",
+                "program": "miner",
+                "variant": "algo",
+                "capture_id": "abc",
+                "source_capture_path": "captures/abc",
+                "binary_label": "mining",
+            },
+        )
+
+    def test_capture_manifest_rows_build_general_specs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture_a = root / "captures" / "abc123456789"
+            capture_b = root / "captures" / "def123456789"
+            capture_a.mkdir(parents=True)
+            capture_b.mkdir(parents=True)
+            manifest_path = root / "manifests.jsonl"
+            manifest_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "capture_path": "captures/abc123456789",
+                                "label": "mining_like",
+                                "family": "ethash_dag_keccak",
+                                "workload": "miner_ethash",
+                                "program": "miner",
+                                "variant": "ethash",
+                                "capture_id": "abc123456789",
+                                "event_type_counts": {"code": 1, "kernel_launch": 2},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "capture_path": "captures/def123456789",
+                                "label": "mining_like",
+                                "family": "ethash_dag_keccak",
+                                "workload": "miner_ethash",
+                                "program": "miner",
+                                "variant": "ethash",
+                                "capture_id": "def123456789",
+                                "event_type_counts": {"code": 1},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            specs = load_capture_manifest_specs([str(manifest_path)], captures_root=root)
+            self.assertEqual(specs[0]["workload"], "miner_ethash")
+            self.assertEqual(specs[1]["workload"], "miner_ethash_def123456789")
+            self.assertEqual(specs[0]["manifest_entry"]["opt_level"], "capture")
+            self.assertEqual(specs[0]["manifest_entry"]["program"], "miner")
+            self.assertFalse(capture_spec_has_no_kernel_launch(specs[0]))
+            self.assertTrue(capture_spec_has_no_kernel_launch(specs[1]))
 
 
 class IngestTests(unittest.TestCase):
@@ -101,9 +190,53 @@ Fatbin elf code:
         self.assertIn("L_0:", rendered)
         self.assertIn("@!P0 BRA L_0", rendered)
 
+    def test_parse_nvdisasm_type_function(self) -> None:
+        text = """
+        .type           cuda_crc32_tweaked,@function
+cuda_crc32_tweaked:
+        /*0000*/                   MOV R1, R2 ;
+        /*0010*/                   EXIT ;
+"""
+        parsed = parse_disassembly(text)
+        self.assertEqual([instr.text for instr in parsed["cuda_crc32_tweaked"]], ["MOV R1, R2", "EXIT"])
+
+    def test_parse_multiline_cuobjdump_function_name(self) -> None:
+        text = "Function : $\t \n \t\n\t.headerflags\t@\"EF_CUDA_SM50\"\n        /*0000*/                   MOV R1, R2 ;\n"
+        parsed = parse_disassembly(text)
+        self.assertEqual(len(parsed), 1)
+        name = next(iter(parsed))
+        self.assertEqual(name, "$\t \n \t")
+        self.assertEqual(parsed[name][0].text, "MOV R1, R2")
+        fallback = select_fallback_function("$\t \r \t", parsed)
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback[2], "canonical_name")
+
     def test_safe_kernel_dir_sanitizes(self) -> None:
         self.assertEqual(safe_kernel_dir("kernel/name:with space"), "kernel_name_with_space")
         self.assertEqual(safe_kernel_dir("_Z6kernelv"), "_Z6kernelv")
+
+    def test_fallback_function_prefers_substring_then_largest(self) -> None:
+        functions = {
+            "_Z18cuda_ethash_searchv": [SASSInstruction("0", "NOP")],
+            "_Z5otherv": [SASSInstruction("0", "NOP"), SASSInstruction("10", "EXIT")],
+        }
+        self.assertEqual(
+            select_fallback_function("cuda_ethash_search", functions)[2],
+            "substring_name",
+        )
+        self.assertEqual(
+            select_fallback_function("missing_name", functions)[0],
+            "_Z5otherv",
+        )
+
+    def test_unique_safe_kernel_dir_handles_repeated_sanitized_names(self) -> None:
+        used: set[str] = set()
+        counts = Counter()
+        first = unique_safe_kernel_dir("$ \n", 0, used, counts)
+        used.add(first)
+        second = unique_safe_kernel_dir("$\t", 0, used, counts)
+        self.assertNotEqual(first, second)
+        self.assertEqual(second, "___code_0")
 
 
 class SassAnalysisTests(unittest.TestCase):
@@ -113,6 +246,31 @@ class SassAnalysisTests(unittest.TestCase):
             "IADD3 REG, REG, CONST, ZERO",
         )
         self.assertEqual(normalize_instruction("@P0 BRA L_3"), "@PRED BRA LABEL")
+        self.assertEqual(
+            normalize_instruction("CALL.REL.NOINC `($cuda_crc32_tweaked$__cuda_sm20_bfe_u64_)"),
+            "CALL LABEL",
+        )
+        self.assertEqual(normalize_instruction("CALL cuda_crc32_tweaked"), "CALL LABEL")
+        self.assertEqual(normalize_instruction("BRA `(.L_x_0)"), "BRA LABEL")
+        self.assertEqual(normalize_instruction("MOV R2, 32@lo(CRCTable)"), "MOV REG, IMM")
+        self.assertEqual(
+            normalize_instruction("LDC R8, c[0x0][0x20] &wr=0 ?trans1"),
+            "LDC REG, CONST",
+        )
+        self.assertEqual(
+            normalize_instruction("S2R R8, SR_TID.X &wr=0 ?trans1"),
+            "S2R REG, SREG",
+        )
+        self.assertEqual(
+            normalize_instruction("FMUL R8, R9, 5.5511151231257827021e-17 &req={0, 1} ?trans1"),
+            "FMUL REG, REG, IMM",
+        )
+        self.assertEqual(normalize_instruction("BSSY B0, `(.L_x_70)"), "BSSY BREG, LABEL")
+        self.assertEqual(normalize_instruction("@P0 BRA L_1ac0 ?trans6"), "@PRED BRA LABEL")
+        self.assertEqual(
+            normalize_instruction('BRX R18 -L_3090 (*"BRANCH_TARGETS .L_x_64634,.L_x_64635"*)'),
+            "BRX REG, LABEL",
+        )
         self.assertEqual(normalize_instruction("LDG.E R8, [R2+0x10]"), "LDG REG, MEM")
 
     def test_normalize_skips_labels(self) -> None:

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Build the SASSGuard synthetic kernel dataset."""
+"""Build a SASSGuard dataset from CUDA capture directories."""
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import re
 import shutil
 import sys
 from collections import Counter
@@ -24,15 +26,12 @@ from sassguard_analysis.ingest import (
     IngestError,
     copy_code_objects,
     read_events,
-    read_process,
     split_events,
-    workload_name_from_process,
     write_launches,
 )
 from sassguard_analysis.loop_extract import extract_main_loop_for_kernel
 from sassguard_analysis.manifest import (
     ManifestError,
-    load_binary_manifest,
     write_json,
     write_workload_manifest,
 )
@@ -46,13 +45,39 @@ class CaptureBuildError(RuntimeError):
     """Raised when one capture cannot produce a workload."""
 
 
+OPT_LEVEL_CAPTURE = "capture"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--captures-dir", type=Path, default=Path("workloads/synthetic_kernels/captures"))
     parser.add_argument(
-        "--binary-manifest",
+        "--capture-manifest",
+        action="append",
+        default=None,
+        help=(
+            "Build from one or more capture manifests.jsonl files. "
+            "May be repeated and may contain shell-style globs. "
+            "Example: --capture-manifest 'workloads/*_samples/*/captures/manifests.jsonl'."
+        ),
+    )
+    parser.add_argument(
+        "--capture-root",
+        dest="capture_root",
         type=Path,
-        default=Path("workloads/synthetic_kernels/binaries/manifest.jsonl"),
+        default=Path("."),
+        help="Root used to resolve relative capture_path entries from capture manifests.",
+    )
+    parser.add_argument(
+        "--skip-empty-captures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip manifest captures that contain no kernel_launch events instead of failing the build.",
+    )
+    parser.add_argument(
+        "--skip-unmapped-captures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip captures whose launched kernels cannot be mapped to disassembled SASS.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("dataset"))
     parser.add_argument("--max-launches", type=int, default=16)
@@ -73,14 +98,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    capture_manifest_patterns = list(
+        args.capture_manifest or ["workloads/synthetic_kernels/captures/manifests.jsonl"]
+    )
+
     try:
-        binary_manifest = load_binary_manifest(args.binary_manifest)
+        capture_specs = load_capture_manifest_specs(
+            capture_manifest_patterns,
+            captures_root=args.capture_root,
+        )
     except ManifestError as exc:
         print(f"[FATAL] {exc}", file=sys.stderr)
-        return 2
-
-    if not args.captures_dir.is_dir():
-        print(f"[FATAL] missing captures directory: {args.captures_dir}", file=sys.stderr)
         return 2
 
     tools = find_cuda_tools()
@@ -89,15 +117,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[INFO] {name}: {tools.get(name, 'not found')}")
 
     report = new_build_report()
-    captures = sorted(path for path in args.captures_dir.iterdir() if path.is_dir())
     if args.jobs < 1:
         print("[FATAL] --jobs must be >= 1", file=sys.stderr)
         return 2
 
     if args.verbose:
         print(f"[INFO] jobs: {args.jobs}")
+        print(f"[INFO] captures: {len(capture_specs)}")
 
-    results = iter_capture_results(captures, args, binary_manifest, tools)
+    results = iter_capture_results(capture_specs, args, tools)
     for result in results:
         report["captures_scanned"] += 1
         if result["status"] == "failed":
@@ -108,7 +136,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if result["status"] == "skipped":
             report["duplicates_skipped"] += 1
+            if result.get("label"):
+                report["labels"][result["label"]] += 1
+            if result.get("opt_level"):
+                report["opt_levels"][result["opt_level"]] += 1
             print(f"[SKIP] duplicate workload already exists: {result['workload']}")
+            continue
+        if result["status"] == "skipped_empty":
+            report["empty_captures_skipped"] += 1
+            print(f"[SKIP] {result['capture']}: {result['reason']}")
+            continue
+        if result["status"] == "skipped_unmapped":
+            report["unmapped_captures_skipped"] += 1
+            print(f"[SKIP] {result['capture']}: {result['reason']}")
             continue
         if result["status"] == "dry_run":
             report["dry_run_ok"] += 1
@@ -127,37 +167,36 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def iter_capture_results(
-    captures: list[Path],
+    capture_specs: list[dict[str, Any]],
     args: argparse.Namespace,
-    binary_manifest: dict[str, dict[str, str]],
     tools: dict[str, Path],
 ):
-    if args.jobs == 1 or len(captures) <= 1:
-        for capture_dir in captures:
-            yield process_capture_worker(capture_dir, args, binary_manifest, tools)
+    if args.jobs == 1 or len(capture_specs) <= 1:
+        for capture_spec in capture_specs:
+            yield process_capture_worker(capture_spec, args, tools)
         return
 
     with ProcessPoolExecutor(max_workers=args.jobs) as executor:
         yield from executor.map(
             _worker_star,
-            [(capture_dir, args, binary_manifest, tools) for capture_dir in captures],
+            [(capture_spec, args, tools) for capture_spec in capture_specs],
             chunksize=1,
         )
 
 
-def _worker_star(payload: tuple[Path, argparse.Namespace, dict[str, dict[str, str]], dict[str, Path]]):
-    capture_dir, args, binary_manifest, tools = payload
-    return process_capture_worker(capture_dir, args, binary_manifest, tools)
+def _worker_star(payload: tuple[dict[str, Any], argparse.Namespace, dict[str, Path]]):
+    capture_spec, args, tools = payload
+    return process_capture_worker(capture_spec, args, tools)
 
 
 def process_capture_worker(
-    capture_dir: Path,
+    capture_spec: dict[str, Any],
     args: argparse.Namespace,
-    binary_manifest: dict[str, dict[str, str]],
     tools: dict[str, Path],
 ) -> dict[str, Any]:
+    capture_dir = Path(capture_spec["capture_dir"])
     try:
-        result = process_capture(capture_dir, args, binary_manifest, tools)
+        result = process_capture(capture_spec, args, tools)
         result["capture"] = capture_dir.name
         return result
     except CaptureBuildError as exc:
@@ -171,21 +210,32 @@ def process_capture_worker(
 
 
 def process_capture(
-    capture_dir: Path,
+    capture_spec: dict[str, Any],
     args: argparse.Namespace,
-    binary_manifest: dict[str, dict[str, str]],
     tools: dict[str, Path],
 ) -> dict[str, Any]:
+    capture_dir = Path(capture_spec["capture_dir"])
     try:
-        process = read_process(capture_dir)
-        workload = workload_name_from_process(process)
-        if workload not in binary_manifest:
-            raise CaptureBuildError(f"missing manifest entry for workload: {workload}")
+        if args.skip_empty_captures and capture_spec_has_no_kernel_launch(capture_spec):
+            return {
+                "status": "skipped_empty",
+                "workload": str(capture_spec["workload"]),
+                "reason": "no kernel_launch event",
+            }
+
+        workload = str(capture_spec["workload"])
+        manifest_entry = dict(capture_spec["manifest_entry"])
 
         workloads_root = args.output_dir / "workloads"
         final_dir = workloads_root / workload
         if final_dir.exists() and args.skip_existing:
-            return {"status": "skipped", "workload": workload}
+            result = {"status": "skipped", "workload": workload}
+            existing_manifest_path = final_dir / "manifest.json"
+            if existing_manifest_path.exists():
+                existing_manifest = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
+                result["label"] = existing_manifest.get("label")
+                result["opt_level"] = existing_manifest.get("opt_level")
+            return result
         if args.dry_run:
             events = read_events(capture_dir)
             split_events(events)
@@ -198,10 +248,15 @@ def process_capture(
         temp_dir.mkdir(parents=True)
 
         try:
-            _build_into_temp_dir(capture_dir, temp_dir, workload, args, binary_manifest[workload], tools)
+            _build_into_temp_dir(capture_dir, temp_dir, workload, args, manifest_entry, tools)
             if final_dir.exists() and args.skip_existing:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                return {"status": "skipped", "workload": workload}
+                return {
+                    "status": "skipped",
+                    "workload": workload,
+                    "label": manifest_entry["label"],
+                    "opt_level": manifest_entry["opt_level"],
+                }
             if final_dir.exists() and not args.skip_existing:
                 shutil.rmtree(final_dir)
             temp_dir.replace(final_dir)
@@ -215,10 +270,26 @@ def process_capture(
         return {
             "status": "created",
             "workload": workload,
-            "label": binary_manifest[workload]["label"],
-            "opt_level": binary_manifest[workload]["opt_level"],
+            "label": manifest_entry["label"],
+            "opt_level": manifest_entry["opt_level"],
         }
-    except (IngestError, DisassemblyError, ValidationError, WorkloadSassError) as exc:
+    except IngestError as exc:
+        if args.skip_empty_captures and str(exc) == "no kernel_launch event":
+            return {
+                "status": "skipped_empty",
+                "workload": str(capture_spec["workload"]),
+                "reason": str(exc),
+            }
+        raise CaptureBuildError(str(exc)) from exc
+    except WorkloadSassError as exc:
+        if args.skip_unmapped_captures and str(exc) == "no launched kernel could be mapped to disassembled SASS":
+            return {
+                "status": "skipped_unmapped",
+                "workload": str(capture_spec["workload"]),
+                "reason": str(exc),
+            }
+        raise CaptureBuildError(str(exc)) from exc
+    except (DisassemblyError, ValidationError) as exc:
         raise CaptureBuildError(str(exc)) from exc
 
 
@@ -264,11 +335,102 @@ def _build_into_temp_dir(
     validate_workload(workload_dir, max_launches=args.max_launches)
 
 
+def load_capture_manifest_specs(
+    manifest_patterns: list[str],
+    captures_root: Path,
+) -> list[dict[str, Any]]:
+    manifest_paths = sorted(
+        {
+            Path(match)
+            for pattern in manifest_patterns
+            for match in (glob.glob(pattern) or [pattern])
+        }
+    )
+    if not manifest_paths:
+        raise ManifestError(f"no capture manifests matched: {', '.join(manifest_patterns)}")
+
+    specs: list[dict[str, Any]] = []
+    used_workloads: Counter[str] = Counter()
+    for manifest_path in manifest_paths:
+        if not manifest_path.exists():
+            raise ManifestError(f"missing capture manifest: {manifest_path}")
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ManifestError(f"{manifest_path}:{line_no}: invalid JSON: {exc}") from exc
+                specs.append(capture_spec_from_manifest_row(row, manifest_path, line_no, captures_root, used_workloads))
+    if not specs:
+        raise ManifestError(f"no capture rows found in: {', '.join(manifest_patterns)}")
+    return specs
+
+
+def capture_spec_from_manifest_row(
+    row: dict[str, Any],
+    manifest_path: Path,
+    line_no: int,
+    captures_root: Path,
+    used_workloads: Counter[str],
+) -> dict[str, Any]:
+    missing = [key for key in ("label", "family", "workload", "program", "variant") if key not in row]
+    if "capture_path" not in row and "capture_dir" not in row:
+        missing.append("capture_path")
+    if missing:
+        raise ManifestError(f"{manifest_path}:{line_no}: missing fields: {', '.join(missing)}")
+
+    capture_path = str(row.get("capture_path") or row["capture_dir"])
+    capture_dir = captures_root / capture_path
+    if not capture_dir.is_dir():
+        raise ManifestError(f"{manifest_path}:{line_no}: missing capture_path: {capture_dir}")
+
+    base_workload = safe_workload_name(str(row["workload"]))
+    capture_id = safe_workload_name(str(row.get("capture_id") or capture_dir.name))
+    used_workloads[base_workload] += 1
+    workload = base_workload
+    if used_workloads[base_workload] > 1:
+        workload = f"{base_workload}_{capture_id[:12]}"
+
+    entry = {
+        "family": str(row["family"]),
+        "label": str(row["label"]),
+        "opt_level": str(row.get("opt_level") or OPT_LEVEL_CAPTURE),
+        "program": str(row["program"]),
+        "variant": str(row["variant"]),
+        "capture_id": str(row.get("capture_id") or capture_dir.name),
+        "source_capture_path": capture_path,
+    }
+    if "binary_label" in row:
+        entry["binary_label"] = str(row["binary_label"])
+    return {
+        "capture_dir": capture_dir,
+        "workload": workload,
+        "manifest_entry": entry,
+        "event_type_counts": row.get("event_type_counts"),
+    }
+
+
+def capture_spec_has_no_kernel_launch(capture_spec: dict[str, Any]) -> bool:
+    counts = capture_spec.get("event_type_counts")
+    if not isinstance(counts, dict):
+        return False
+    return int(counts.get("kernel_launch") or 0) == 0
+
+
+def safe_workload_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_").lower()
+    return cleaned or "unknown"
+
+
 def new_build_report() -> dict[str, Any]:
     return {
         "captures_scanned": 0,
         "workloads_created": 0,
         "duplicates_skipped": 0,
+        "empty_captures_skipped": 0,
+        "unmapped_captures_skipped": 0,
         "failed_captures": 0,
         "dry_run_ok": 0,
         "labels": Counter(),
@@ -293,6 +455,8 @@ def print_summary(report: dict[str, Any]) -> None:
     print(f"captures scanned: {report['captures_scanned']}")
     print(f"workloads created: {report['workloads_created']}")
     print(f"duplicates skipped: {report['duplicates_skipped']}")
+    print(f"empty captures skipped: {report['empty_captures_skipped']}")
+    print(f"unmapped captures skipped: {report['unmapped_captures_skipped']}")
     print(f"failed captures: {report['failed_captures']}")
     if report["dry_run_ok"]:
         print(f"dry-run valid captures: {report['dry_run_ok']}")

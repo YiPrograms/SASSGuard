@@ -13,7 +13,9 @@ from typing import Any
 from .manifest import write_json
 
 
-FUNCTION_RE = re.compile(r"\bFunction\s*:\s*(?P<name>\S+)")
+FUNCTION_RE = re.compile(r"\bFunction\s*:\s*", re.MULTILINE)
+FUNCTION_HEADER_END_RE = re.compile(r"\n[ \t]*\.headerflags\b")
+FUNCTION_TYPE_RE = re.compile(r"\.type\s+(?P<name>[^,\s]+)\s*,\s*@function")
 INSTR_RE = re.compile(r"/\*(?P<addr>[0-9a-fA-F]+)\*/\s*(?P<instr>.*?)\s*;")
 BRANCH_TARGET_RE = re.compile(r"\b(?P<op>BRA|JMP|JMX|BRX)\b[^;]*\b(?P<target>0x[0-9a-fA-F]+)\b")
 
@@ -42,6 +44,7 @@ def split_launched_kernels(
     kernel_dirs: dict[tuple[str, Any], Path] = {}
     missing: list[dict[str, Any]] = []
     used_dirs: set[str] = set()
+    dir_counts: Counter[str] = Counter()
 
     for (kernel_name, code_id), launch in first_seen.items():
         if not kernel_name:
@@ -49,19 +52,22 @@ def split_launched_kernels(
             continue
         functions = functions_by_code.get(str(code_id), {})
         instructions = functions.get(str(kernel_name))
+        matched_function = str(kernel_name)
+        match_reason = "exact"
         if not instructions:
-            missing.append(
-                {
-                    "kernel_name": kernel_name,
-                    "code_id": code_id,
-                    "reason": "launched kernel not found in disassembly",
-                }
-            )
-            continue
+            fallback = select_fallback_function(str(kernel_name), functions)
+            if fallback is None:
+                missing.append(
+                    {
+                        "kernel_name": kernel_name,
+                        "code_id": code_id,
+                        "reason": "launched kernel not found in disassembly",
+                    }
+                )
+                continue
+            matched_function, instructions, match_reason = fallback
 
-        safe_dir = safe_kernel_dir(str(kernel_name))
-        if safe_dir in used_dirs:
-            safe_dir = f"{safe_dir}__code_{code_id}"
+        safe_dir = unique_safe_kernel_dir(str(kernel_name), code_id, used_dirs, dir_counts)
         used_dirs.add(safe_dir)
         out_dir = kernels_dir / safe_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +76,8 @@ def split_launched_kernels(
         source = code_map[str(code_id)]["dump_path"] if str(code_id) in code_map else None
         metadata = {
             "kernel_name": kernel_name,
+            "disassembly_function": matched_function,
+            "kernel_match": match_reason,
             "safe_kernel_dir": safe_dir,
             "code_id": code_id,
             "source_code_file": source,
@@ -83,13 +91,52 @@ def split_launched_kernels(
     return kernel_dirs, missing
 
 
+def select_fallback_function(
+    kernel_name: str,
+    functions: dict[str, list[SASSInstruction]],
+) -> tuple[str, list[SASSInstruction], str] | None:
+    if not functions:
+        return None
+
+    canonical_target = canonical_kernel_name(kernel_name)
+    canonical_matches = [
+        (name, instructions)
+        for name, instructions in functions.items()
+        if canonical_kernel_name(name) == canonical_target
+    ]
+    if canonical_matches:
+        name, instructions = max(canonical_matches, key=lambda item: len(item[1]))
+        return name, instructions, "canonical_name"
+
+    compact_target = compact_kernel_name(kernel_name)
+    substring_matches = [
+        (name, instructions)
+        for name, instructions in functions.items()
+        if compact_target
+        and compact_target != "$"
+        and (
+            compact_target in compact_kernel_name(name)
+            or compact_kernel_name(name) in compact_target
+        )
+    ]
+    if substring_matches:
+        name, instructions = max(substring_matches, key=lambda item: len(item[1]))
+        return name, instructions, "substring_name"
+
+    name, instructions = max(functions.items(), key=lambda item: len(item[1]))
+    return name, instructions, "largest_function_fallback"
+
+
 def parse_disassembly(text: str) -> dict[str, list[SASSInstruction]]:
+    if "Function :" in text:
+        return parse_cuobjdump_functions(text)
+
     functions: dict[str, list[SASSInstruction]] = {}
     current_name: str | None = None
     current: list[SASSInstruction] = []
 
     for line in text.splitlines():
-        match = FUNCTION_RE.search(line)
+        match = FUNCTION_TYPE_RE.search(line)
         if match:
             if current_name is not None:
                 functions[current_name] = current
@@ -108,6 +155,35 @@ def parse_disassembly(text: str) -> dict[str, list[SASSInstruction]]:
     if current_name is not None:
         functions[current_name] = current
     return functions
+
+
+def parse_cuobjdump_functions(text: str) -> dict[str, list[SASSInstruction]]:
+    functions: dict[str, list[SASSInstruction]] = {}
+    markers = list(FUNCTION_RE.finditer(text))
+    for index, marker in enumerate(markers):
+        body_end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        after_marker = text[marker.end() : body_end]
+        header_end = FUNCTION_HEADER_END_RE.search(after_marker)
+        if header_end:
+            name = after_marker[: header_end.start()]
+            body = after_marker[header_end.end() :]
+        else:
+            first_line, separator, rest = after_marker.partition("\n")
+            name = first_line.strip()
+            body = rest if separator else after_marker
+        instructions = parse_instructions(body)
+        if instructions:
+            functions[name] = instructions
+    return functions
+
+
+def parse_instructions(text: str) -> list[SASSInstruction]:
+    instructions: list[SASSInstruction] = []
+    for instr_match in INSTR_RE.finditer(text):
+        instr = _clean_instruction(instr_match.group("instr"))
+        if instr:
+            instructions.append(SASSInstruction(instr_match.group("addr").lower(), instr))
+    return instructions
 
 
 def render_kernel_sass(instructions: list[SASSInstruction]) -> str:
@@ -129,6 +205,34 @@ def safe_kernel_dir(kernel_name: str) -> str:
         digest = hashlib.sha1(kernel_name.encode("utf-8")).hexdigest()[:12]
         safe = f"{safe[:100]}_{digest}"
     return safe
+
+
+def unique_safe_kernel_dir(
+    kernel_name: str,
+    code_id: Any,
+    used_dirs: set[str],
+    dir_counts: Counter[str],
+) -> str:
+    base = safe_kernel_dir(kernel_name)
+    dir_counts[base] += 1
+    if base not in used_dirs:
+        return base
+
+    suffix_base = f"{base}__code_{code_id}"
+    candidate = suffix_base
+    index = dir_counts[base]
+    while candidate in used_dirs:
+        index += 1
+        candidate = f"{suffix_base}_{index}"
+    return candidate
+
+
+def canonical_kernel_name(name: str) -> str:
+    return name.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def compact_kernel_name(name: str) -> str:
+    return re.sub(r"\s+", "", name)
 
 
 def count_instruction_lines(lines: list[str]) -> int:

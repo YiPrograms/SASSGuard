@@ -5,8 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
 python3 analysis/build_dataset.py \
-  --captures-dir workloads/synthetic_kernels/captures \
-  --binary-manifest workloads/synthetic_kernels/binaries/manifest.jsonl \
+  --capture-root . \
   --output-dir dataset \
   --max-launches 16 \
   "$@"

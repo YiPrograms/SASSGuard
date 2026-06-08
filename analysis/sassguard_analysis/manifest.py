@@ -46,13 +46,23 @@ def load_binary_manifest(path: Path) -> dict[str, dict[str, str]]:
 
 
 def workload_manifest(workload_name: str, entry: dict[str, str]) -> dict[str, str]:
-    """Return the exact dataset workload manifest shape."""
-    return {
+    """Return a dataset workload manifest with optional capture provenance."""
+    manifest = {
         "workload": workload_name,
         "family": entry["family"],
         "label": entry["label"],
         "opt_level": entry["opt_level"],
     }
+    for key in (
+        "program",
+        "variant",
+        "capture_id",
+        "source_capture_path",
+        "binary_label",
+    ):
+        if key in entry:
+            manifest[key] = entry[key]
+    return manifest
 
 
 def write_workload_manifest(path: Path, workload_name: str, entry: dict[str, str]) -> None:
