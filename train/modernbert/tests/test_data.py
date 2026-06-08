@@ -135,6 +135,46 @@ class ModernBertDataTests(unittest.TestCase):
         self.assertAlmostEqual(fields["mining_probability_mean"], 0.35)
         self.assertAlmostEqual(fields["mining_probability_max"], 0.95)
 
+    def test_suspicious_fields_fire_from_mean_pooling_mining_prediction(self) -> None:
+        chunks = [
+            self._chunk("w0", 0, 1),
+            self._chunk("w0", 1, 1),
+            self._chunk("w0", 2, 1),
+        ]
+        aggregated = aggregate_chunk_probabilities(
+            chunks,
+            [
+                [0.42, 0.58],
+                [0.43, 0.57],
+                [0.44, 0.56],
+            ],
+        )
+        self.assertEqual(aggregated["w0"]["pred_id"], 1)
+        fields = suspicious_prediction_fields(aggregated["w0"], {0: "benign", 1: "mining"})
+        self.assertTrue(fields["suspicious"])
+        self.assertEqual(fields["suspicious_reason"], "mean_pooling_decision")
+        self.assertEqual(fields["suspicious_label"], "suspicious")
+
+    def test_suspicious_fields_report_below_threshold_for_benign_prediction(self) -> None:
+        chunks = [
+            self._chunk("w0", 0, 0),
+            self._chunk("w0", 1, 0),
+            self._chunk("w0", 2, 0),
+        ]
+        aggregated = aggregate_chunk_probabilities(
+            chunks,
+            [
+                [0.65, 0.35],
+                [0.62, 0.38],
+                [0.6, 0.4],
+            ],
+        )
+        self.assertEqual(aggregated["w0"]["pred_id"], 0)
+        fields = suspicious_prediction_fields(aggregated["w0"], {0: "benign", 1: "mining"})
+        self.assertFalse(fields["suspicious"])
+        self.assertEqual(fields["suspicious_reason"], "below_threshold")
+        self.assertEqual(fields["suspicious_label"], "benign")
+
     def _record(self, workload: str, label_id: int) -> WorkloadRecord:
         return WorkloadRecord(
             split="train",

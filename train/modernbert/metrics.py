@@ -163,13 +163,20 @@ def suspicious_prediction_fields(
     mining_mean = float(pooling["mean"])
     mining_max = float(pooling["max"])
     mining_topk = float(pooling[topk_key])
-    suspicious = mining_max >= max_threshold or mining_topk >= topk_threshold
-    if mining_max >= max_threshold:
+    mean_pooling_predicts_mining = int(prediction["pred_id"]) == mining_label_id
+    suspicious = (
+        mean_pooling_predicts_mining
+        or mining_max >= max_threshold
+        or mining_topk >= topk_threshold
+    )
+    if mean_pooling_predicts_mining:
+        reason = "mean_pooling_decision"
+    elif mining_max >= max_threshold:
         reason = f"max_p_mining>={max_threshold:g}"
     elif mining_topk >= topk_threshold:
         reason = f"top{k}_mean_p_mining>={topk_threshold:g}"
     else:
-        reason = "mean_pooling_decision"
+        reason = "below_threshold"
     return {
         "mining_probability_mean": mining_mean,
         "mining_probability_max": mining_max,
@@ -210,6 +217,7 @@ def suspicious_metrics(
         "enabled": True,
         "mining_label": id2label[mining_label_id],
         "rule": {
+            "mean_pooling_mining_prediction": True,
             "max_p_mining_threshold": DEFAULT_SUSPICIOUS_MAX_THRESHOLD,
             "top_k": DEFAULT_SUSPICIOUS_TOP_K,
             "topk_mean_p_mining_threshold": DEFAULT_SUSPICIOUS_TOPK_THRESHOLD,
