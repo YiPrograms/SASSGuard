@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
         total_launches++;
         total_nonces += static_cast<uint64_t>(args.blocks) * static_cast<uint64_t>(args.threads) * static_cast<uint64_t>(args.nonces_per_thread);
         if (args.sync_every > 0 && total_launches % static_cast<uint64_t>(args.sync_every) == 0) CUDA_CHECK(cudaDeviceSynchronize());
+        sleep_after_launch_if_requested(args);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     unsigned int h_result_count = 0;
