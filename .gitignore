@@ -2,3 +2,50 @@
 
 # Default output directory for the SassGuard collector server.
 sassguard-data/
+
+# Generated datasets and workload captures.
+dataset/
+dataset_realworld/
+baseline_dataset/
+sassguard-online/
+workloads/synthetic_kernels/capture_throttle_*/
+workloads/benign_samples/**/captures/
+workloads/benign_samples/**/logs/
+workloads/benign_samples/**/ShareGPT_*.json
+workloads/benign_samples/vllm_benchmark/prompts.json
+workloads/benign_samples/blender/*.tar.*
+workloads/benign_samples/blender/blender-*-linux-x64*/
+workloads/benign_samples/blender/debs/
+workloads/benign_samples/blender/local-libs/
+workloads/benign_samples/nv_hpl/Library/
+workloads/benign_samples/nv_hpl/xhpl
+workloads/benign_samples/nv_hpl/*.log
+
+__pycache__/
+
+# Python/ML training environments and outputs.
+.venv/
+venv/
+.pytest_cache/
+*.pyc
+
+# ModernBERT training artifacts.
+models/modernbert/checkpoints/
+models/modernbert/tokenizer/
+experiments/results/reports/modernbert/
+
+# Experiment outputs.
+experiments/results/
+experiments/overhead/*.log
+experiments/overhead/*.cubin
+experiments/overhead/drivertest
+
+# LaTeX build outputs.
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/svg-inkscape/

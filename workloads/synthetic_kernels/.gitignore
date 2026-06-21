@@ -1,3 +1,4 @@
 build
 binaries
-captures
+captures/
+capture_throttle_*/
