@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--split", choices=("train", "val", "test"), default="test")
+    parser.add_argument("--split", choices=("train", "val", "test", "all"), default="test")
     return parser.parse_args()
 
 
@@ -45,7 +45,15 @@ def main() -> None:
         run_config.label_column,
         run_config.label2id,
     )
-    chunks = make_chunks(records_by_split[args.split], tokenizer, run_config.max_seq_length, run_config.stride)
+    if args.split == "all":
+        records = [
+            record
+            for split in ("train", "val", "test")
+            for record in records_by_split[split]
+        ]
+    else:
+        records = records_by_split[args.split]
+    chunks = make_chunks(records, tokenizer, run_config.max_seq_length, run_config.stride)
     model_config = AutoConfig.from_pretrained(checkpoint)
     if hasattr(model_config, "reference_compile"):
         model_config.reference_compile = False
@@ -64,10 +72,15 @@ def main() -> None:
     )
     predictions = trainer.predict(ChunkDataset(chunks), metric_key_prefix=args.split)
     report = workload_metrics(
-        records_by_split[args.split],
+        records,
         chunks,
         softmax_rows(predictions.predictions),
         run_config.id2label,
+        aggregate_by_group=bool(run_config.raw.get("evaluation", {}).get("aggregate_by_group", False)),
+        group_policy=str(run_config.raw.get("evaluation", {}).get("group_policy", "any_window_suspicious")),
+        mean_mining_probability_threshold=float(
+            run_config.raw.get("evaluation", {}).get("mean_mining_probability_threshold", 0.30)
+        ),
     )
     report_path = run_config.paths.reports_dir / f"evaluate_{args.split}_report.json"
     if not is_distributed_launch() or trainer.is_world_process_zero():

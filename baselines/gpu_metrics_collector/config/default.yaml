@@ -1,0 +1,8 @@
+gpu: 0
+sampling_interval_sec: 1.0
+output_dir: baseline_dataset/gpu_metrics/raw
+features_dir: baseline_dataset/gpu_metrics/features
+window_sec: 60.0
+step_sec: 5.0
+min_valid_sample_ratio: 0.8
+manifest_timeout_sec: 120.0

@@ -1,0 +1,12 @@
+# V100/Volta GPUs are compute capability 7.0. The PyPI default CUDA 13.x
+# PyTorch wheels do not include sm_70 kernels, so use the CUDA 12.6 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.12.0+cu126
+transformers>=4.48.0,<5.0.0
+tokenizers>=0.21.0,<0.22.0
+datasets
+accelerate
+scikit-learn
+numpy
+fsspec<=2026.2.0
+tqdm

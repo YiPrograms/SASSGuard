@@ -31,6 +31,9 @@ def build_modernbert_config(
             "sep_token_id": tokenizer.sep_token_id,
         }
     )
+    # ModernBERT defaults to compiling internal reference layers in some
+    # Transformers releases. That path can conflict with Trainer/FX tracing.
+    model_kwargs.setdefault("reference_compile", False)
     if num_labels is not None:
         model_kwargs.update(
             {

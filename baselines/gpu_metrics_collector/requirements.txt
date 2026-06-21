@@ -1,0 +1,7 @@
+nvidia-ml-py
+psutil
+numpy
+pandas
+scikit-learn
+pyyaml
+xgboost

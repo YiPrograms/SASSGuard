@@ -106,6 +106,8 @@ def read_sass(record: WorkloadRecord) -> str:
 
 def iter_sass_texts(records: Iterable[WorkloadRecord]) -> Iterator[str]:
     for record in records:
+        if record.row.get("no_l0_window"):
+            continue
         yield read_sass(record)
 
 
@@ -115,6 +117,8 @@ def make_chunks_for_record(
     max_seq_length: int,
     stride: int,
 ) -> list[ChunkRecord]:
+    if record.row.get("no_l0_window"):
+        return []
     content_window = max_seq_length - 2
     if content_window <= 0:
         raise ValueError("max_seq_length must leave room for [CLS] and [SEP]")
@@ -181,7 +185,17 @@ def encode_content_ids(tokenizer: TokenizerLike, text: str) -> list[int]:
 
 
 def class_weights(records: Iterable[WorkloadRecord], label2id: dict[str, int]) -> list[float]:
-    counts = Counter(record.label_id for record in records)
+    group_labels: dict[str, int] = {}
+    for record in records:
+        if record.row.get("no_l0_window"):
+            continue
+        group_id = workload_group_id(record)
+        existing = group_labels.get(group_id)
+        if existing is not None and existing != record.label_id:
+            raise ValueError(f"conflicting labels for workload group {group_id!r}")
+        group_labels[group_id] = record.label_id
+
+    counts = Counter(group_labels.values())
     total = sum(counts.values())
     num_labels = len(label2id)
     weights: list[float] = []
@@ -191,6 +205,10 @@ def class_weights(records: Iterable[WorkloadRecord], label2id: dict[str, int]) -
             raise ValueError(f"cannot compute class weight for missing label id {label_id}")
         weights.append(total / (num_labels * count))
     return weights
+
+
+def workload_group_id(record: WorkloadRecord) -> str:
+    return str(record.row.get("group_id") or record.row.get("parent_workload") or record.workload)
 
 
 class ChunkDataset:

@@ -8,6 +8,11 @@
     "benign": 0,
     "mining": 1
   },
+  "evaluation": {
+    "aggregate_by_group": true,
+    "group_policy": "mean_mining_probability",
+    "mean_mining_probability_threshold": 0.30
+  },
   "max_seq_length": 8192,
   "stride": 1024,
   "tokenizer": {

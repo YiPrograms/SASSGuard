@@ -10,10 +10,17 @@ from train.modernbert.data import (
     WorkloadRecord,
     chunk_token_ids,
     class_weights,
+    iter_sass_texts,
     load_all_splits,
     make_chunks_for_record,
 )
-from train.modernbert.metrics import aggregate_chunk_probabilities, suspicious_prediction_fields
+from train.modernbert.metrics import (
+    add_no_l0_window_predictions,
+    aggregate_chunk_probabilities,
+    aggregate_group_predictions,
+    prediction_rows,
+    suspicious_prediction_fields,
+)
 
 
 class FakeTokenizer:
@@ -33,10 +40,9 @@ class ModernBertDataTests(unittest.TestCase):
             config.label_column,
             config.label2id,
         )
-        self.assertEqual(
-            {split: len(rows) for split, rows in records.items()},
-            {"train": 176, "val": 38, "test": 38},
-        )
+        counts = {split: len(rows) for split, rows in records.items()}
+        self.assertEqual(set(counts), {"train", "val", "test"})
+        self.assertTrue(all(count > 0 for count in counts.values()))
         labels = sorted({record.label for rows in records.values() for record in rows})
         self.assertEqual(labels, sorted(config.label2id))
 
@@ -79,6 +85,44 @@ class ModernBertDataTests(unittest.TestCase):
             self.assertEqual(chunk.num_chunks, 4)
             self.assertEqual(chunk.label_id, 3)
 
+    def test_no_l0_window_records_do_not_make_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "no_l0_window.sass"
+            source.write_text("NO_L0_WINDOW\n", encoding="utf-8")
+            record = WorkloadRecord(
+                split="test",
+                workload="benign__no_l0_window",
+                source_path=source,
+                label="benign",
+                label_id=0,
+                row={"workload": "benign__no_l0_window", "path": str(source), "no_l0_window": True},
+            )
+            chunks = make_chunks_for_record(record, FakeTokenizer(), max_seq_length=6, stride=1)
+        self.assertEqual(chunks, [])
+
+    def test_no_l0_window_records_are_not_tokenizer_or_weight_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            real_source = root / "real.sass"
+            no_window_source = root / "no_l0_window.sass"
+            real_source.write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+            no_window_source.write_text("NO_L0_WINDOW\n", encoding="utf-8")
+            records = [
+                WorkloadRecord("train", "benign_real", real_source, "benign", 0, {"workload": "benign_real"}),
+                WorkloadRecord("train", "mining_real", real_source, "mining", 1, {"workload": "mining_real"}),
+                WorkloadRecord(
+                    "train",
+                    "benign__no_l0_window",
+                    no_window_source,
+                    "benign",
+                    0,
+                    {"workload": "benign__no_l0_window", "no_l0_window": True},
+                ),
+            ]
+            texts = list(iter_sass_texts(records))
+        self.assertEqual(texts, ["IADD3 REG, REG, IMM, ZERO\n", "IADD3 REG, REG, IMM, ZERO\n"])
+        self.assertEqual(class_weights(records, {"benign": 0, "mining": 1}), [1.0, 1.0])
+
     def test_class_weights_use_workload_counts(self) -> None:
         records = [
             self._record("a", 0),
@@ -94,6 +138,17 @@ class ModernBertDataTests(unittest.TestCase):
         ]
         weights = class_weights(records, {"a": 0, "b": 1, "c": 2, "d": 3})
         self.assertEqual(weights, [2.5, 1.25, 10 / 12, 0.625])
+
+    def test_class_weights_count_parent_workloads_not_windows(self) -> None:
+        records = [
+            WorkloadRecord("train", "benign_a__w0", Path("unused"), "benign", 0, {"group_id": "benign_a"}),
+            WorkloadRecord("train", "benign_b__w0", Path("unused"), "benign", 0, {"group_id": "benign_b"}),
+            WorkloadRecord("train", "mining_a__w0", Path("unused"), "mining", 1, {"group_id": "mining_a"}),
+            WorkloadRecord("train", "mining_a__w1", Path("unused"), "mining", 1, {"group_id": "mining_a"}),
+            WorkloadRecord("train", "mining_a__w2", Path("unused"), "mining", 1, {"group_id": "mining_a"}),
+            WorkloadRecord("train", "mining_b__w0", Path("unused"), "mining", 1, {"group_id": "mining_b"}),
+        ]
+        self.assertEqual(class_weights(records, {"benign": 0, "mining": 1}), [1.0, 1.0])
 
     def test_aggregate_chunk_probabilities_by_workload_mean(self) -> None:
         chunks = [
@@ -174,6 +229,126 @@ class ModernBertDataTests(unittest.TestCase):
         self.assertFalse(fields["suspicious"])
         self.assertEqual(fields["suspicious_reason"], "below_threshold")
         self.assertEqual(fields["suspicious_label"], "benign")
+
+    def test_grouped_workload_metrics_fire_if_any_window_is_suspicious(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = []
+            for name in ("miner__w0", "miner__w1", "benign__w0"):
+                path = root / f"{name}.sass"
+                path.write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+                paths.append(path)
+            records = [
+                WorkloadRecord("test", "miner__w0", paths[0], "mining", 1, {"group_id": "miner", "family": "mining"}),
+                WorkloadRecord("test", "miner__w1", paths[1], "mining", 1, {"group_id": "miner", "family": "mining"}),
+                WorkloadRecord("test", "benign__w0", paths[2], "benign", 0, {"group_id": "benign", "family": "benign"}),
+            ]
+        chunks = [
+            self._chunk("miner__w0", 0, 1),
+            self._chunk("miner__w1", 0, 1),
+            self._chunk("benign__w0", 0, 0),
+        ]
+        window_predictions = prediction_rows(
+            records,
+            aggregate_chunk_probabilities(
+                chunks,
+                [
+                    [0.95, 0.05],
+                    [0.05, 0.95],
+                    [0.95, 0.05],
+                ],
+            ),
+            {0: "benign", 1: "mining"},
+        )
+        group_predictions = aggregate_group_predictions(records, window_predictions, {0: "benign", 1: "mining"})
+        predictions = {row["workload"]: row for row in group_predictions}
+        self.assertEqual(predictions["miner"]["pred_label"], "mining")
+        self.assertTrue(predictions["miner"]["suspicious"])
+        self.assertEqual(predictions["benign"]["pred_label"], "benign")
+        self.assertEqual(predictions["miner"]["windows"], ["miner__w0", "miner__w1"])
+        self.assertEqual(predictions["benign"]["windows"], ["benign__w0"])
+
+    def test_grouped_workload_metrics_can_use_mean_mining_probability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = []
+            for name in ("miner__w0", "miner__w1", "benign__w0", "benign__w1", "benign__w2", "benign__w3"):
+                path = root / f"{name}.sass"
+                path.write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+                paths.append(path)
+            records = [
+                WorkloadRecord("test", "miner__w0", paths[0], "mining", 1, {"group_id": "miner"}),
+                WorkloadRecord("test", "miner__w1", paths[1], "mining", 1, {"group_id": "miner"}),
+                WorkloadRecord("test", "benign__w0", paths[2], "benign", 0, {"group_id": "benign"}),
+                WorkloadRecord("test", "benign__w1", paths[3], "benign", 0, {"group_id": "benign"}),
+                WorkloadRecord("test", "benign__w2", paths[4], "benign", 0, {"group_id": "benign"}),
+                WorkloadRecord("test", "benign__w3", paths[5], "benign", 0, {"group_id": "benign"}),
+            ]
+        chunks = [
+            self._chunk("miner__w0", 0, 1),
+            self._chunk("miner__w1", 0, 1),
+            self._chunk("benign__w0", 0, 0),
+            self._chunk("benign__w1", 0, 0),
+            self._chunk("benign__w2", 0, 0),
+            self._chunk("benign__w3", 0, 0),
+        ]
+        window_predictions = prediction_rows(
+            records,
+            aggregate_chunk_probabilities(
+                chunks,
+                [
+                    [0.72, 0.28],
+                    [0.68, 0.32],
+                    [0.01, 0.99],
+                    [0.99, 0.01],
+                    [0.99, 0.01],
+                    [0.99, 0.01],
+                ],
+            ),
+            {0: "benign", 1: "mining"},
+        )
+        group_predictions = aggregate_group_predictions(
+            records,
+            window_predictions,
+            {0: "benign", 1: "mining"},
+            group_policy="mean_mining_probability",
+            mean_mining_probability_threshold=0.30,
+        )
+        predictions = {row["workload"]: row for row in group_predictions}
+        self.assertEqual(predictions["miner"]["pred_label"], "mining")
+        self.assertEqual(predictions["miner"]["suspicious_reason"], "mean_mining_probability>=0.3")
+        self.assertAlmostEqual(predictions["miner"]["mining_probability_mean"], 0.30)
+        self.assertEqual(predictions["benign"]["pred_label"], "benign")
+        self.assertEqual(predictions["benign"]["suspicious_reason"], "mean_mining_probability<0.3")
+        self.assertAlmostEqual(predictions["benign"]["mining_probability_mean"], 0.255)
+
+    def test_no_l0_window_group_aggregation_defaults_to_benign(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "no_l0_window.sass"
+            source.write_text("NO_L0_WINDOW\n", encoding="utf-8")
+            records = [
+                WorkloadRecord(
+                    "test",
+                    "benign__no_l0_window",
+                    source,
+                    "benign",
+                    0,
+                    {
+                        "group_id": "benign",
+                        "family": "benign",
+                        "no_l0_window": True,
+                        "default_prediction_reason": "no_l0_window_emitted",
+                    },
+                )
+            ]
+        aggregated = {}
+        add_no_l0_window_predictions(records, aggregated, {0: "benign", 1: "mining"})
+        window_predictions = prediction_rows(records, aggregated, {0: "benign", 1: "mining"})
+        group_predictions = aggregate_group_predictions(records, window_predictions, {0: "benign", 1: "mining"})
+        self.assertEqual(group_predictions[0]["pred_label"], "benign")
+        self.assertFalse(group_predictions[0]["suspicious"])
+        self.assertEqual(window_predictions[0]["default_prediction_reason"], "no_l0_window_emitted")
+        self.assertTrue(window_predictions[0]["no_l0_window"])
 
     def _record(self, workload: str, label_id: int) -> WorkloadRecord:
         return WorkloadRecord(

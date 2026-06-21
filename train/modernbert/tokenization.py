@@ -145,6 +145,8 @@ def unk_rate(tokenizer: Any, records: list[WorkloadRecord]) -> dict[str, Any]:
     unknown = 0
     unknown_tokens: Counter[str] = Counter()
     for record in records:
+        if record.row.get("no_l0_window"):
+            continue
         text = read_sass(record)
         ids = tokenizer.encode(text, add_special_tokens=False)
         total += len(ids)

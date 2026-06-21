@@ -71,11 +71,13 @@ def build_workload_trainer_class():
         workload_eval_records: Any = None
         workload_eval_chunks: Any = None
         workload_id2label: Any = None
+        workload_eval_options: Any = None
 
-        def set_workload_eval(self, records: Any, chunks: Any, id2label: Any) -> None:
+        def set_workload_eval(self, records: Any, chunks: Any, id2label: Any, **options: Any) -> None:
             self.workload_eval_records = records
             self.workload_eval_chunks = chunks
             self.workload_id2label = id2label
+            self.workload_eval_options = options
 
         def evaluate(self, eval_dataset: Any = None, ignore_keys: Any = None, metric_key_prefix: str = "eval"):
             metrics = super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -92,6 +94,7 @@ def build_workload_trainer_class():
                 self.workload_eval_chunks,
                 probabilities,
                 self.workload_id2label,
+                **(self.workload_eval_options or {}),
             )
             metrics[f"{metric_key_prefix}_accuracy"] = workload_report["accuracy"]
             metrics[f"{metric_key_prefix}_macro_f1"] = workload_report["macro_f1"]
@@ -143,7 +146,16 @@ def main() -> None:
         trainer = trainer_cls(**trainer_kwargs, tokenizer=tokenizer)
     if bool(run_config.raw["classifier"].get("class_weighted_loss", True)):
         trainer.set_class_weights(weights)
-    trainer.set_workload_eval(records_by_split["val"], chunks_by_split["val"], run_config.id2label)
+    trainer.set_workload_eval(
+        records_by_split["val"],
+        chunks_by_split["val"],
+        run_config.id2label,
+        aggregate_by_group=bool(run_config.raw.get("evaluation", {}).get("aggregate_by_group", False)),
+        group_policy=str(run_config.raw.get("evaluation", {}).get("group_policy", "any_window_suspicious")),
+        mean_mining_probability_threshold=float(
+            run_config.raw.get("evaluation", {}).get("mean_mining_probability_threshold", 0.30)
+        ),
+    )
 
     train_result = trainer.train()
     final_output = final_dir(output_dir)
@@ -168,6 +180,11 @@ def main() -> None:
             chunks_by_split[split],
             probabilities,
             run_config.id2label,
+            aggregate_by_group=bool(run_config.raw.get("evaluation", {}).get("aggregate_by_group", False)),
+            group_policy=str(run_config.raw.get("evaluation", {}).get("group_policy", "any_window_suspicious")),
+            mean_mining_probability_threshold=float(
+                run_config.raw.get("evaluation", {}).get("mean_mining_probability_threshold", 0.30)
+            ),
         )
         if trainer.is_world_process_zero():
             reports["splits"][split] = split_report
