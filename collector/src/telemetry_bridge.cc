@@ -3,6 +3,8 @@
 
 #include <pthread.h>
 #include <cstdlib>
+#include <cstring>
+#include <strings.h>
 #include <string>
 
 #include "debug.h"
@@ -11,6 +13,8 @@ namespace {
 
 SGClientConfig telemetry_config{};
 pthread_t telemetry_thread;
+bool telemetry_initialized = false;
+bool telemetry_started = false;
 
 uint32_t env_u32(const char *name, uint32_t fallback) {
 #ifdef CUHOOK_DEBUG
@@ -36,6 +40,13 @@ const char *env_string(const char *name, const char *fallback) {
   return fallback;
 }
 
+bool env_capture_disabled() {
+  const char *value = getenv(SASSGUARD_CAPTURE_DISABLE_ENV);
+  if (value == nullptr) return false;
+  return strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0;
+}
+
 void *start_go_client(void *) {
   sg_go_start(&telemetry_config);
   DEBUG("telemetry client started, server %s", telemetry_config.server_addr);
@@ -46,6 +57,11 @@ void *start_go_client(void *) {
 
 __attribute__((constructor))
 static void telemetry_constructor(void) {
+  if (env_capture_disabled()) {
+    DEBUG("telemetry disabled by %s", SASSGUARD_CAPTURE_DISABLE_ENV);
+    return;
+  }
+
   telemetry_config.server_addr =
       env_string("SASSGUARD_SERVER_ADDR", SASSGUARD_DEFAULT_SERVER_ADDR);
   telemetry_config.ring_capacity =
@@ -63,11 +79,16 @@ static void telemetry_constructor(void) {
 #endif
   telemetry_config.hook_version = SASSGUARD_HOOK_VERSION;
 
-  sg_telemetry_init(telemetry_config.ring_capacity);
+  telemetry_initialized = sg_telemetry_init(telemetry_config.ring_capacity) != 0;
+  if (!telemetry_initialized) {
+    DEBUG("failed to initialize telemetry ring");
+    return;
+  }
 
   int err = pthread_create(&telemetry_thread, nullptr, start_go_client, nullptr);
   if (err == 0) {
     pthread_detach(telemetry_thread);
+    telemetry_started = true;
   } else {
     DEBUG("failed to start telemetry client thread: %d", err);
   }
@@ -75,6 +96,10 @@ static void telemetry_constructor(void) {
 
 __attribute__((destructor))
 static void telemetry_destructor(void) {
-  sg_go_stop();
-  sg_telemetry_shutdown();
+  if (telemetry_started) {
+    sg_go_stop();
+  }
+  if (telemetry_initialized) {
+    sg_telemetry_shutdown();
+  }
 }

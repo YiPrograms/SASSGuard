@@ -80,7 +80,7 @@ $(BUILD)/telemetry_bridge.o: src/telemetry_bridge.cc include/telemetry.h include
 $(GO_ARCHIVE): $(GO_DIR)/client/main.go $(GO_DIR)/go.mod $(GO_DIR)/go.sum $(GO_DIR)/protocol/telemetry.pb.go include/telemetry.h | $(BUILD)
 	cd $(GO_DIR) && $(GO_ENV) $(GO) build -buildmode=c-archive -o ../$(GO_ARCHIVE) ./client
 
-$(GO_SERVER): $(GO_DIR)/cmd/sassguard-collector/main.go $(GO_DIR)/go.mod $(GO_DIR)/go.sum $(GO_DIR)/protocol/telemetry.pb.go | $(BUILD)
+$(GO_SERVER): $(GO_DIR)/cmd/sassguard-collector/*.go $(GO_DIR)/go.mod $(GO_DIR)/go.sum $(GO_DIR)/protocol/telemetry.pb.go | $(BUILD)
 	cd $(GO_DIR) && $(GO_ENV) $(GO) build -o ../$(GO_SERVER) ./cmd/sassguard-collector
 
 $(TARGET): $(OBJS) $(GO_ARCHIVE)

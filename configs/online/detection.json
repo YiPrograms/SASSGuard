@@ -1,0 +1,59 @@
+{
+  "enabled": true,
+  "collector": {
+    "listen_addr": "127.0.0.1:59400"
+  },
+  "transport": {
+    "processor_socket": "/tmp/sassguard-online.sock",
+    "socket_permissions": "0600",
+    "connect_timeout_ms": 1000,
+    "write_timeout_ms": 5000,
+    "read_timeout_ms": 1000,
+    "reconnect_backoff_ms": 1000,
+    "frame_max_bytes": 10485760
+  },
+  "storage": {
+    "collector_output_dir": "sassguard-data",
+    "processor_work_dir": "sassguard-online",
+    "keep_processor_artifacts": true
+  },
+  "l0": {
+    "config_path": "configs/analysis/l0_windows.json"
+  },
+  "launch_batching": {
+    "max_batch_count": 128,
+    "flush_interval_ms": 10,
+    "max_unsent_per_session": 8192
+  },
+  "kernel_analysis": {
+    "workers": 2,
+    "short_kernel_threshold": 256,
+    "max_code_queue_per_session": 256,
+    "readiness_timeout_ms": 30000
+  },
+  "l1": {
+    "training_config_path": "configs/training/modernbert_sass_compact_binary_realworld.json",
+    "checkpoint_path": "models/modernbert/checkpoints/sass-modernbert-compact-binary/classifier/final",
+    "device": "auto",
+    "devices": [],
+    "inference_workers": "auto",
+    "batch_size": 1
+  },
+  "verdict": {
+    "mining_label": "mining",
+    "policy": "rolling_mean_and_max",
+    "rolling_window_count": 8,
+    "rolling_mean_mining_probability_threshold": 0.3,
+    "rolling_max_mining_probability_threshold": 0.5,
+    "max_p_mining_threshold": 0.9,
+    "top_k": 3,
+    "topk_mean_p_mining_threshold": 0.75,
+    "mean_pooling_mining_prediction": true
+  },
+  "enforcement": {
+    "enabled": true,
+    "fail_open": true,
+    "terminate_action": "hook_command",
+    "message": "SASSGuard detected mining-like GPU code; terminating process."
+  }
+}

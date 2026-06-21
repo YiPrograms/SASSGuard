@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -148,6 +149,7 @@ func runClient(cfg clientConfig, stop <-chan struct{}, done chan<- struct{}) {
 
 		err = sendHandshake(conn, &cfg)
 		if err == nil {
+			go controlLoop(conn, cfg.sessionID)
 			err = drainLoop(conn, &cfg, stop)
 		}
 		conn.Close()
@@ -303,6 +305,48 @@ func writeEnvelope(w io.Writer, env *protocol.Envelope) error {
 	}
 	_, err = w.Write(payload)
 	return err
+}
+
+func controlLoop(conn net.Conn, sessionID string) {
+	for {
+		payload, err := readControlFrame(conn)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		var env protocol.ServerEnvelope
+		if err := proto.Unmarshal(payload, &env); err != nil {
+			continue
+		}
+		if env.SessionId != "" && env.SessionId != sessionID {
+			continue
+		}
+		control := env.GetControl()
+		if control == nil {
+			continue
+		}
+		message := control.Message
+		if message == "" {
+			message = "SASSGuard control command received"
+		}
+		fmt.Fprintf(os.Stderr, "%s reason=%s window=%s mining_probability=%.6f\n",
+			message, control.Reason, control.WindowId, control.MiningProbability)
+		if control.Action == protocol.ControlAction_CONTROL_ACTION_TERMINATE {
+			_ = conn.Close()
+			os.Exit(101)
+		}
+	}
+}
+
+func readControlFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
 }
 
 func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {

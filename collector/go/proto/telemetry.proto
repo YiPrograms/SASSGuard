@@ -64,3 +64,26 @@ message StatsEvent {
   uint64 dropped_bytes = 2;
   uint64 queued_events = 3;
 }
+
+message ServerEnvelope {
+  string session_id = 1;
+  uint64 timestamp_ns = 2;
+
+  oneof command {
+    ControlCommand control = 10;
+  }
+}
+
+message ControlCommand {
+  ControlAction action = 1;
+  string message = 2;
+  string reason = 3;
+  double mining_probability = 4;
+  string window_id = 5;
+}
+
+enum ControlAction {
+  CONTROL_ACTION_UNSPECIFIED = 0;
+  CONTROL_ACTION_LOG = 1;
+  CONTROL_ACTION_TERMINATE = 2;
+}

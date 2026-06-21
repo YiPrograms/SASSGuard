@@ -19,56 +19,95 @@ import (
 )
 
 type collector struct {
-	root string
+	root     string
+	mu       sync.Mutex
+	online   *onlineClient
+	batcher  *launchBatcher
+	sessions map[string]*clientSession
+	cfg      onlineConfig
+}
+
+type clientSession struct {
+	conn net.Conn
 	mu   sync.Mutex
 }
 
 func main() {
-	listenAddr := flag.String("listen", "127.0.0.1:59400", "TCP listen address")
-	outDir := flag.String("out", "sassguard-data", "output directory")
+	configPath := flag.String("config", defaultOnlineConfigPath, "online detection config")
 	flag.Parse()
 
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+	cfg, err := loadOnlineConfig(*configPath)
+	if err != nil {
 		fatal(err)
 	}
 
-	ln, err := net.Listen("tcp", *listenAddr)
+	if err := os.MkdirAll(cfg.Storage.CollectorOutputDir, 0o755); err != nil {
+		fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", cfg.Collector.ListenAddr)
 	if err != nil {
 		fatal(err)
 	}
 	defer ln.Close()
 
-	c := &collector{root: *outDir}
-	fmt.Fprintf(os.Stderr, "sassguard collector listening on %s, output %s\n", *listenAddr, *outDir)
+	c := &collector{root: cfg.Storage.CollectorOutputDir, sessions: make(map[string]*clientSession), cfg: cfg}
+	if cfg.Enabled {
+		c.online = newOnlineClient(cfg)
+		c.online.start()
+		c.batcher = newLaunchBatcher(c.online, cfg)
+		go c.handleVerdicts()
+		logf("online detection enabled processor_socket=%s enforcement=%v", cfg.Transport.ProcessorSocket, cfg.Enforcement.Enabled)
+	} else {
+		logf("online detection disabled")
+	}
+	logf("sassguard collector listening on %s, output %s", cfg.Collector.ListenAddr, cfg.Storage.CollectorOutputDir)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			fatal(err)
 		}
+		logf("hook client connected remote=%s", conn.RemoteAddr())
 		go c.handleConn(conn)
 	}
 }
 
 func (c *collector) handleConn(conn net.Conn) {
 	defer conn.Close()
+	var sessionID string
+	defer func() {
+		if sessionID != "" {
+			if c.batcher != nil {
+				c.batcher.endSession(sessionID)
+			}
+			if c.online != nil {
+				c.online.endSession(sessionID, "hook_connection_closed")
+			}
+			c.unregisterSessionConn(sessionID, conn)
+		}
+	}()
 
 	for {
 		payload, err := readFrame(conn)
 		if err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				fmt.Fprintf(os.Stderr, "connection error: %v\n", err)
+				logf("hook connection error session=%s error=%v", shortSession(sessionID), err)
 			}
 			return
 		}
 
 		var env protocol.Envelope
 		if err := proto.Unmarshal(payload, &env); err != nil {
-			fmt.Fprintf(os.Stderr, "decode envelope: %v\n", err)
+			logf("decode envelope failed: %v", err)
 			return
 		}
+		if env.SessionId != "" {
+			sessionID = env.SessionId
+			c.registerSessionConn(env.SessionId, conn)
+		}
 		if err := c.store(&env); err != nil {
-			fmt.Fprintf(os.Stderr, "store event: %v\n", err)
+			logf("store event failed session=%s error=%v", shortSession(env.SessionId), err)
 			return
 		}
 	}
@@ -115,7 +154,7 @@ func (c *collector) store(env *protocol.Envelope) error {
 	case *protocol.Envelope_Code:
 		return c.storeCode(sessionDir, env, event.Code)
 	case *protocol.Envelope_KernelLaunch:
-		return c.appendJSONL(sessionDir, "events.jsonl", map[string]any{
+		row := map[string]any{
 			"type":              "kernel_launch",
 			"received_at":       time.Now().Format(time.RFC3339Nano),
 			"session_id":        env.SessionId,
@@ -130,9 +169,25 @@ func (c *collector) store(env *protocol.Envelope) error {
 			"shared_mem_bytes":  event.KernelLaunch.SharedMemBytes,
 			"stream":            event.KernelLaunch.Stream,
 			"device_pci_bus_id": event.KernelLaunch.DevicePciBusId,
-		})
+		}
+		if c.batcher != nil {
+			c.batcher.add(env.SessionId, map[string]any{
+				"sequence":          env.Sequence,
+				"timestamp_ns":      env.TimestampNs,
+				"pid":               env.Pid,
+				"tid":               env.Tid,
+				"kernel_name":       event.KernelLaunch.KernelName,
+				"code_id":           event.KernelLaunch.CodeId,
+				"grid_dim":          []uint32{event.KernelLaunch.GridDimX, event.KernelLaunch.GridDimY, event.KernelLaunch.GridDimZ},
+				"block_dim":         []uint32{event.KernelLaunch.BlockDimX, event.KernelLaunch.BlockDimY, event.KernelLaunch.BlockDimZ},
+				"shared_mem_bytes":  event.KernelLaunch.SharedMemBytes,
+				"stream":            event.KernelLaunch.Stream,
+				"device_pci_bus_id": event.KernelLaunch.DevicePciBusId,
+			})
+		}
+		return c.appendJSONL(sessionDir, "events.jsonl", row)
 	case *protocol.Envelope_Stats:
-		return c.appendJSONL(sessionDir, "events.jsonl", map[string]any{
+		row := map[string]any{
 			"type":           "stats",
 			"received_at":    time.Now().Format(time.RFC3339Nano),
 			"session_id":     env.SessionId,
@@ -142,7 +197,11 @@ func (c *collector) store(env *protocol.Envelope) error {
 			"dropped_events": event.Stats.DroppedEvents,
 			"dropped_bytes":  event.Stats.DroppedBytes,
 			"queued_events":  event.Stats.QueuedEvents,
-		})
+		}
+		if c.online != nil {
+			c.online.send(row)
+		}
+		return c.appendJSONL(sessionDir, "events.jsonl", row)
 	default:
 		return c.appendJSONL(sessionDir, "events.jsonl", map[string]any{
 			"type":         "unknown",
@@ -189,7 +248,21 @@ func (c *collector) storeProcessInfo(sessionDir string, env *protocol.Envelope, 
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return err
+	}
+	logf("process info stored session=%s pid=%d exe=%s", shortSession(env.SessionId), env.Pid, info.ExePath)
+	if c.online != nil {
+		c.online.send(map[string]any{
+			"type":         "process_info",
+			"session_id":   env.SessionId,
+			"sequence":     env.Sequence,
+			"timestamp_ns": env.TimestampNs,
+			"pid":          env.Pid,
+			"process_info": doc,
+		})
+	}
+	return nil
 }
 
 func (c *collector) storeCode(sessionDir string, env *protocol.Envelope, code *protocol.CodeEvent) error {
@@ -201,6 +274,22 @@ func (c *collector) storeCode(sessionDir string, env *protocol.Envelope, code *p
 	path := filepath.Join(sessionDir, "code", safeName(name))
 	if err := os.WriteFile(path, code.Data, 0o644); err != nil {
 		return err
+	}
+	logf("code stored session=%s code_id=%d size=%d sha256=%s", shortSession(env.SessionId), code.CodeId, len(code.Data), hash)
+	if c.online != nil {
+		c.online.send(map[string]any{
+			"type":         "code_object",
+			"session_id":   env.SessionId,
+			"sequence":     env.Sequence,
+			"timestamp_ns": env.TimestampNs,
+			"pid":          env.Pid,
+			"tid":          env.Tid,
+			"code_id":      code.CodeId,
+			"code_type":    code.CodeType,
+			"sha256":       hash,
+			"size":         len(code.Data),
+			"path":         absPath(path),
+		})
 	}
 	return c.appendJSONL(sessionDir, "events.jsonl", map[string]any{
 		"type":         "code",
@@ -216,6 +305,94 @@ func (c *collector) storeCode(sessionDir string, env *protocol.Envelope, code *p
 		"size":         len(code.Data),
 		"path":         filepath.ToSlash(filepath.Join("code", safeName(name))),
 	})
+}
+
+func (c *collector) registerSessionConn(sessionID string, conn net.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current := c.sessions[sessionID]; current == nil || current.conn != conn {
+		logf("session registered session=%s", shortSession(sessionID))
+		c.sessions[sessionID] = &clientSession{conn: conn}
+	}
+}
+
+func (c *collector) unregisterSessionConn(sessionID string, conn net.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current := c.sessions[sessionID]
+	if current != nil && current.conn == conn {
+		delete(c.sessions, sessionID)
+		logf("session unregistered session=%s", shortSession(sessionID))
+	}
+}
+
+func (c *collector) sendControl(sessionID string, verdict processorVerdict) error {
+	c.mu.Lock()
+	session := c.sessions[sessionID]
+	c.mu.Unlock()
+	if session == nil {
+		return fmt.Errorf("no active client connection for session %s", sessionID)
+	}
+	action := protocol.ControlAction_CONTROL_ACTION_LOG
+	if verdict.Action == "terminate" && c.cfg.Enforcement.Enabled {
+		action = protocol.ControlAction_CONTROL_ACTION_TERMINATE
+	}
+	message := verdict.Message
+	if message == "" {
+		message = c.cfg.Enforcement.Message
+	}
+	miningProbability := 0.0
+	if prediction := verdict.Prediction; prediction != nil {
+		if value, ok := prediction["mining_probability_max"].(float64); ok {
+			miningProbability = value
+		}
+	}
+	env := &protocol.ServerEnvelope{
+		SessionId:   sessionID,
+		TimestampNs: uint64(time.Now().UnixNano()),
+		Command: &protocol.ServerEnvelope_Control{Control: &protocol.ControlCommand{
+			Action:            action,
+			Message:           message,
+			Reason:            verdict.Reason,
+			MiningProbability: miningProbability,
+			WindowId:          verdict.WindowID,
+		}},
+	}
+	payload, err := proto.Marshal(env)
+	if err != nil {
+		return err
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := session.conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err = session.conn.Write(payload)
+	if err == nil {
+		logf("hook control sent session=%s action=%s window=%s reason=%s", shortSession(sessionID), action.String(), verdict.WindowID, verdict.Reason)
+	}
+	return err
+}
+
+func (c *collector) handleVerdicts() {
+	for verdict := range c.online.verdictCh {
+		if verdict.SessionID == "" {
+			continue
+		}
+		logf("online verdict session=%s window=%s suspicious=%v reason=%s", shortSession(verdict.SessionID), verdict.WindowID, verdict.Suspicious, verdict.Reason)
+		if !verdict.Suspicious && verdict.Action != "terminate" {
+			continue
+		}
+		if !c.cfg.Enforcement.Enabled {
+			logf("enforcement disabled; verdict logged only session=%s", shortSession(verdict.SessionID))
+			continue
+		}
+		if err := c.sendControl(verdict.SessionID, verdict); err != nil {
+			logf("send hook control failed session=%s error=%v", shortSession(verdict.SessionID), err)
+		}
+	}
 }
 
 func (c *collector) appendJSONL(sessionDir string, name string, value any) error {

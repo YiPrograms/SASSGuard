@@ -21,6 +21,55 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ControlAction int32
+
+const (
+	ControlAction_CONTROL_ACTION_UNSPECIFIED ControlAction = 0
+	ControlAction_CONTROL_ACTION_LOG         ControlAction = 1
+	ControlAction_CONTROL_ACTION_TERMINATE   ControlAction = 2
+)
+
+// Enum value maps for ControlAction.
+var (
+	ControlAction_name = map[int32]string{
+		0: "CONTROL_ACTION_UNSPECIFIED",
+		1: "CONTROL_ACTION_LOG",
+		2: "CONTROL_ACTION_TERMINATE",
+	}
+	ControlAction_value = map[string]int32{
+		"CONTROL_ACTION_UNSPECIFIED": 0,
+		"CONTROL_ACTION_LOG":         1,
+		"CONTROL_ACTION_TERMINATE":   2,
+	}
+)
+
+func (x ControlAction) Enum() *ControlAction {
+	p := new(ControlAction)
+	*p = x
+	return p
+}
+
+func (x ControlAction) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ControlAction) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_telemetry_proto_enumTypes[0].Descriptor()
+}
+
+func (ControlAction) Type() protoreflect.EnumType {
+	return &file_proto_telemetry_proto_enumTypes[0]
+}
+
+func (x ControlAction) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ControlAction.Descriptor instead.
+func (ControlAction) EnumDescriptor() ([]byte, []int) {
+	return file_proto_telemetry_proto_rawDescGZIP(), []int{0}
+}
+
 type Envelope struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	SessionId   string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -611,6 +660,164 @@ func (x *StatsEvent) GetQueuedEvents() uint64 {
 	return 0
 }
 
+type ServerEnvelope struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	SessionId   string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	TimestampNs uint64                 `protobuf:"varint,2,opt,name=timestamp_ns,json=timestampNs,proto3" json:"timestamp_ns,omitempty"`
+	// Types that are valid to be assigned to Command:
+	//
+	//	*ServerEnvelope_Control
+	Command       isServerEnvelope_Command `protobuf_oneof:"command"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServerEnvelope) Reset() {
+	*x = ServerEnvelope{}
+	mi := &file_proto_telemetry_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServerEnvelope) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServerEnvelope) ProtoMessage() {}
+
+func (x *ServerEnvelope) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_telemetry_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServerEnvelope.ProtoReflect.Descriptor instead.
+func (*ServerEnvelope) Descriptor() ([]byte, []int) {
+	return file_proto_telemetry_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ServerEnvelope) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ServerEnvelope) GetTimestampNs() uint64 {
+	if x != nil {
+		return x.TimestampNs
+	}
+	return 0
+}
+
+func (x *ServerEnvelope) GetCommand() isServerEnvelope_Command {
+	if x != nil {
+		return x.Command
+	}
+	return nil
+}
+
+func (x *ServerEnvelope) GetControl() *ControlCommand {
+	if x != nil {
+		if x, ok := x.Command.(*ServerEnvelope_Control); ok {
+			return x.Control
+		}
+	}
+	return nil
+}
+
+type isServerEnvelope_Command interface {
+	isServerEnvelope_Command()
+}
+
+type ServerEnvelope_Control struct {
+	Control *ControlCommand `protobuf:"bytes,10,opt,name=control,proto3,oneof"`
+}
+
+func (*ServerEnvelope_Control) isServerEnvelope_Command() {}
+
+type ControlCommand struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Action            ControlAction          `protobuf:"varint,1,opt,name=action,proto3,enum=sassguard.telemetry.v1.ControlAction" json:"action,omitempty"`
+	Message           string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Reason            string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	MiningProbability float64                `protobuf:"fixed64,4,opt,name=mining_probability,json=miningProbability,proto3" json:"mining_probability,omitempty"`
+	WindowId          string                 `protobuf:"bytes,5,opt,name=window_id,json=windowId,proto3" json:"window_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *ControlCommand) Reset() {
+	*x = ControlCommand{}
+	mi := &file_proto_telemetry_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ControlCommand) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ControlCommand) ProtoMessage() {}
+
+func (x *ControlCommand) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_telemetry_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ControlCommand.ProtoReflect.Descriptor instead.
+func (*ControlCommand) Descriptor() ([]byte, []int) {
+	return file_proto_telemetry_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ControlCommand) GetAction() ControlAction {
+	if x != nil {
+		return x.Action
+	}
+	return ControlAction_CONTROL_ACTION_UNSPECIFIED
+}
+
+func (x *ControlCommand) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *ControlCommand) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *ControlCommand) GetMiningProbability() float64 {
+	if x != nil {
+		return x.MiningProbability
+	}
+	return 0
+}
+
+func (x *ControlCommand) GetWindowId() string {
+	if x != nil {
+		return x.WindowId
+	}
+	return ""
+}
+
 var File_proto_telemetry_proto protoreflect.FileDescriptor
 
 const file_proto_telemetry_proto_rawDesc = "" +
@@ -672,7 +879,24 @@ const file_proto_telemetry_proto_rawDesc = "" +
 	"StatsEvent\x12%\n" +
 	"\x0edropped_events\x18\x01 \x01(\x04R\rdroppedEvents\x12#\n" +
 	"\rdropped_bytes\x18\x02 \x01(\x04R\fdroppedBytes\x12#\n" +
-	"\rqueued_events\x18\x03 \x01(\x04R\fqueuedEventsB$Z\"sassguard/hookgo/protocol;protocolb\x06proto3"
+	"\rqueued_events\x18\x03 \x01(\x04R\fqueuedEvents\"\xa1\x01\n" +
+	"\x0eServerEnvelope\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12!\n" +
+	"\ftimestamp_ns\x18\x02 \x01(\x04R\vtimestampNs\x12B\n" +
+	"\acontrol\x18\n" +
+	" \x01(\v2&.sassguard.telemetry.v1.ControlCommandH\x00R\acontrolB\t\n" +
+	"\acommand\"\xcd\x01\n" +
+	"\x0eControlCommand\x12=\n" +
+	"\x06action\x18\x01 \x01(\x0e2%.sassguard.telemetry.v1.ControlActionR\x06action\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12-\n" +
+	"\x12mining_probability\x18\x04 \x01(\x01R\x11miningProbability\x12\x1b\n" +
+	"\twindow_id\x18\x05 \x01(\tR\bwindowId*e\n" +
+	"\rControlAction\x12\x1e\n" +
+	"\x1aCONTROL_ACTION_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12CONTROL_ACTION_LOG\x10\x01\x12\x1c\n" +
+	"\x18CONTROL_ACTION_TERMINATE\x10\x02B$Z\"sassguard/hookgo/protocol;protocolb\x06proto3"
 
 var (
 	file_proto_telemetry_proto_rawDescOnce sync.Once
@@ -686,26 +910,32 @@ func file_proto_telemetry_proto_rawDescGZIP() []byte {
 	return file_proto_telemetry_proto_rawDescData
 }
 
-var file_proto_telemetry_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_proto_telemetry_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_telemetry_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_proto_telemetry_proto_goTypes = []any{
-	(*Envelope)(nil),          // 0: sassguard.telemetry.v1.Envelope
-	(*ProcessInfoEvent)(nil),  // 1: sassguard.telemetry.v1.ProcessInfoEvent
-	(*ClientHello)(nil),       // 2: sassguard.telemetry.v1.ClientHello
-	(*CodeEvent)(nil),         // 3: sassguard.telemetry.v1.CodeEvent
-	(*KernelLaunchEvent)(nil), // 4: sassguard.telemetry.v1.KernelLaunchEvent
-	(*StatsEvent)(nil),        // 5: sassguard.telemetry.v1.StatsEvent
+	(ControlAction)(0),        // 0: sassguard.telemetry.v1.ControlAction
+	(*Envelope)(nil),          // 1: sassguard.telemetry.v1.Envelope
+	(*ProcessInfoEvent)(nil),  // 2: sassguard.telemetry.v1.ProcessInfoEvent
+	(*ClientHello)(nil),       // 3: sassguard.telemetry.v1.ClientHello
+	(*CodeEvent)(nil),         // 4: sassguard.telemetry.v1.CodeEvent
+	(*KernelLaunchEvent)(nil), // 5: sassguard.telemetry.v1.KernelLaunchEvent
+	(*StatsEvent)(nil),        // 6: sassguard.telemetry.v1.StatsEvent
+	(*ServerEnvelope)(nil),    // 7: sassguard.telemetry.v1.ServerEnvelope
+	(*ControlCommand)(nil),    // 8: sassguard.telemetry.v1.ControlCommand
 }
 var file_proto_telemetry_proto_depIdxs = []int32{
-	1, // 0: sassguard.telemetry.v1.Envelope.process_info:type_name -> sassguard.telemetry.v1.ProcessInfoEvent
-	2, // 1: sassguard.telemetry.v1.Envelope.client_hello:type_name -> sassguard.telemetry.v1.ClientHello
-	3, // 2: sassguard.telemetry.v1.Envelope.code:type_name -> sassguard.telemetry.v1.CodeEvent
-	4, // 3: sassguard.telemetry.v1.Envelope.kernel_launch:type_name -> sassguard.telemetry.v1.KernelLaunchEvent
-	5, // 4: sassguard.telemetry.v1.Envelope.stats:type_name -> sassguard.telemetry.v1.StatsEvent
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	2, // 0: sassguard.telemetry.v1.Envelope.process_info:type_name -> sassguard.telemetry.v1.ProcessInfoEvent
+	3, // 1: sassguard.telemetry.v1.Envelope.client_hello:type_name -> sassguard.telemetry.v1.ClientHello
+	4, // 2: sassguard.telemetry.v1.Envelope.code:type_name -> sassguard.telemetry.v1.CodeEvent
+	5, // 3: sassguard.telemetry.v1.Envelope.kernel_launch:type_name -> sassguard.telemetry.v1.KernelLaunchEvent
+	6, // 4: sassguard.telemetry.v1.Envelope.stats:type_name -> sassguard.telemetry.v1.StatsEvent
+	8, // 5: sassguard.telemetry.v1.ServerEnvelope.control:type_name -> sassguard.telemetry.v1.ControlCommand
+	0, // 6: sassguard.telemetry.v1.ControlCommand.action:type_name -> sassguard.telemetry.v1.ControlAction
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_proto_telemetry_proto_init() }
@@ -720,18 +950,22 @@ func file_proto_telemetry_proto_init() {
 		(*Envelope_KernelLaunch)(nil),
 		(*Envelope_Stats)(nil),
 	}
+	file_proto_telemetry_proto_msgTypes[6].OneofWrappers = []any{
+		(*ServerEnvelope_Control)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_telemetry_proto_rawDesc), len(file_proto_telemetry_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   6,
+			NumEnums:      1,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_proto_telemetry_proto_goTypes,
 		DependencyIndexes: file_proto_telemetry_proto_depIdxs,
+		EnumInfos:         file_proto_telemetry_proto_enumTypes,
 		MessageInfos:      file_proto_telemetry_proto_msgTypes,
 	}.Build()
 	File_proto_telemetry_proto = out.File
