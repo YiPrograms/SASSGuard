@@ -1,0 +1,379 @@
+\section{Introduction}
+
+GPUs are expensive shared resources, and unauthorized cryptomining turns that shared resource into private profit. Modern HPC clusters, cloud GPU pools, and AI serving platforms routinely run workloads that are both long-lived and compute intensive. A miner can therefore waste accelerator time, power, cooling capacity, and memory bandwidth while looking, at a coarse level, like legitimate deep learning inference, dense linear algebra, simulation, rendering, or benchmarking.
+
+Existing defenses usually infer GPU cryptomining from indirect evidence rather than from the submitted GPU computation. Network monitors inspect pool traffic, host monitors inspect processes or system calls, GPU telemetry monitors inspect utilization and power, hardware-counter methods inspect aggregate execution behavior, and physical side-channel systems inspect external signals. These signals can show that a GPU is busy or that a process repeatedly launches kernels, but they do not directly answer the security question: whether the submitted GPU code contains a mining search loop rather than a legitimate high-throughput kernel.
+
+This paper presents \textit{GPU-Sentry}, a system for instruction-level detection of cryptomining-like GPU computation. GPU-Sentry transparently captures CUDA code objects and kernel-launch events at the CUDA Driver API boundary, reconstructs the SASS assembly submitted to the GPU, normalizes the instruction stream to reduce compiler and architecture noise, and builds stream-level windows that preserve CUDA launch order. A ModernBERT sequence classifier then labels each normalized instruction window as mining or benign. GPU-Sentry detects computation that is mining-like; whether that computation is unauthorized is a deployment policy decision made using the code-level signal together with runtime context.
+
+The central insight behind GPU-Sentry is that mining remains visible in the instruction stream even when host-level evidence is weak. A user can rename processes and kernels, pack or obfuscate the host binary, throttle launch loops, build custom miners, or co-run mining with benign GPU jobs. These evasions change names, timing, or surrounding activity, but the GPU must still receive executable kernels that implement hash, memory-hard, graph-search, or nonce-search computation. GPU-Sentry therefore treats the submitted GPU program as the primary evidence and uses telemetry only as a comparison point in evaluation.
+
+\begin{table*}[t]
+    \centering
+    \caption{Detection approaches expose different evidence. GPU-Sentry is designed to inspect the submitted GPU computation and attribute it to CUDA execution context.}
+    \label{tab:feature_comparison}
+    \footnotesize
+    \begin{tabular}{lccccc}
+        \toprule
+        Capability & Network / flow & Behavioral telemetry & Physical side channel & Static host binary & \textbf{GPU-Sentry} \\
+        \midrule
+        Sees submitted GPU computation & $\times$ & $\times$ & $\times$ & $\sim$ & \textbf{$\checkmark$} \\
+        Robust to process or kernel renaming & $\times$ & $\checkmark$ & $\checkmark$ & $\times$ & \textbf{$\checkmark$} \\
+        Robust to host-binary obfuscation & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\times$ & \textbf{$\checkmark$} \\
+        Robust to launch-rate throttling & $\times$ & $\times$ & $\times$ & n/a & \textbf{$\checkmark$} \\
+        Supports mixed benign and mining work & $\times$ & $\times$ & $\times$ & n/a & \textbf{$\checkmark$} \\
+        Pinpoints offending process context & $\sim$ & $\times$ & $\times$ & $\checkmark$ & \textbf{$\checkmark$} \\
+        No external sensor required & $\checkmark$ & $\checkmark$ & $\times$ & $\checkmark$ & \textbf{$\checkmark$} \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+GPU-Sentry must solve several practical challenges to make instruction-level detection usable. First, GPU code can arrive as PTX, fatbins, CUBINs, files, or in-memory blobs, so a detector must observe the final code objects loaded by the CUDA software stack. Second, CUDA applications run through frameworks, libraries, native processes, and containers, so capture must work without rewriting user applications. Third, SASS changes across architectures, compiler versions, optimization levels, and register-allocation decisions, so the model input must preserve computation while removing unstable details. Fourth, public GPU-miner datasets are limited, so the detector must learn from synthetic training workloads and transfer to real captures.
+
+GPU-Sentry addresses these challenges with four contributions:
+\begin{itemize}
+    \item a transparent CUDA Driver API capture layer that records code objects and launch events for native and containerized workloads;
+    \item a normalized SASS representation with control-flow driven main-loop extraction and architecture-aware opcode-family mapping;
+    \item a stream-level instruction-window scheduler that condenses repeated launches and selects mature, repetitive, or changed windows without classifying every launch;
+    \item a synthetic-to-real training and evaluation workflow showing that instruction-level detection remains effective under launch-rate throttling, and that telemetry baselines fail under throttling or mixed-workload stress.
+\end{itemize}
+
+\section{Background and Threat Model}
+
+\subsection{CUDA Code Execution}
+
+CUDA applications reach the GPU through a layered software stack. Applications may call the CUDA Runtime API directly, use CUDA libraries, or run through frameworks such as deep learning runtimes. These layers eventually use the CUDA Driver API to load modules or libraries, obtain kernel handles, and launch kernels on CUDA streams. Streams are ordered execution queues, so launches in the same stream preserve program order even when other streams execute concurrently.
+
+NVIDIA GPU code appears in several representations before execution. PTX is a virtual instruction set that can be just-in-time compiled for a target GPU. Fatbins can bundle PTX and architecture-specific binaries. CUBINs contain compiled GPU machine code. The final instruction representation executed by NVIDIA hardware is SASS. GPU-Sentry focuses on SASS because it is closest to the computation that reaches the device after host compilation, library loading, and PTX translation.
+
+\subsection{Threat Model}
+
+GPU-Sentry assumes a monitored host whose administrator controls the CUDA driver deployment and the GPU-Sentry collector. An unprivileged user may run arbitrary CUDA applications on the host or inside a container. The user's miner may rename processes and kernels, strip symbols, obfuscate the host binary, compile custom kernels, change optimization levels, throttle launches, or co-run mining kernels with benign GPU work.
+
+The attacker is not assumed to control the host administrator, the kernel driver, or the GPU-Sentry collector. CPU-only mining is outside the scope of this paper. A same-privilege user who can bypass or replace the monitored userspace driver boundary is discussed as a deployment limitation in \cref{sec:limitations}.
+
+\section{Motivation and Design Challenges}
+\label{sec:motivation}
+
+\subsection{Why Telemetry Is Not Enough}
+
+Telemetry-based detection is attractive because it is easy to deploy, but it does not identify the submitted computation. GPU utilization, memory utilization, power draw, temperature, and hardware counters can distinguish some isolated miners from idle or ordinary jobs. However, many benign GPU applications are also compute intensive, and many miners can reduce or mask their device-level footprint by changing launch timing or running beside benign work. In those cases, telemetry describes the effect of execution but not the code that produced it.
+
+Our checked-in behavioral baseline illustrates this limitation. A Random Forest over whole-device GPU measurements reaches 0.980 run-level accuracy on ordinary isolated test runs, but its run-level recall falls to 0.479 under kernel-launch throttling and to 2/7 on archived mixed benign-plus-mining runs. These failures occur because mining evidence is diluted in time or hidden inside device-level aggregate signals. GPU-Sentry instead inspects normalized SASS windows, so launch-rate throttling changes when windows mature but not the kernel body eventually analyzed.
+
+\subsection{Design Challenges}
+
+GPU-Sentry's design is driven by the mismatch between what cryptomining detection needs and what conventional monitoring exposes. \textbf{C1: Code-object diversity.} CUDA code can be loaded from PTX, fatbins, CUBINs, files, or memory buffers, so GPU-Sentry hooks Driver API module and library load paths and captures the code actually submitted to the runtime. \textbf{C2: Transparent deployment.} Applications may be native, framework-driven, or containerized, so GPU-Sentry uses a replacement \texttt{libcuda.so.1} at the Driver API boundary rather than application-specific instrumentation. \textbf{C3: SASS variation.} SASS is architecture and compiler dependent, so GPU-Sentry normalizes operands and maps architecture-specific opcode variants to semantic families. \textbf{C4: Repeated and split execution.} Miners can launch the same kernel repeatedly or distribute work across helper kernels, so GPU-Sentry analyzes stream-level instruction windows rather than isolated kernel names. \textbf{C5: Limited real training data.} Public real miner captures are limited, so GPU-Sentry trains on synthetic workloads and reserves all real-world captures for evaluation only.
+
+\section{System Design}
+\label{sec:design}
+
+\subsection{Overview}
+\label{sec:design_overview}
+
+GPU-Sentry exists to turn opaque CUDA activity into auditable instruction-level evidence. \Cref{fig:architecture} shows the pipeline. A client-side CUDA interception library captures code-load and launch events, forwards them asynchronously to a collector, and keeps the application-facing CUDA path lightweight. The collector reconstructs code objects, normalizes SASS, builds stream-local launch windows, renders each window as an instruction sequence, and sends the sequence to the ModernBERT detector. The detector returns a mining score and a verdict that can be logged, reported, or used by an administrator-defined enforcement policy.
+
+\begin{figure*}[t]
+    \centering
+    \includesvg[width=0.92\textwidth]{Figures/Architecture}
+    \caption{GPU-Sentry architecture. The capture layer records CUDA code-load and launch activity, while the collector reconstructs normalized SASS, builds stream-level windows, and invokes the instruction-sequence detector.}
+    \label{fig:architecture}
+\end{figure*}
+
+GPU-Sentry separates capture from analysis because CUDA API calls are latency sensitive. The interception path creates compact events and places them in an in-process ring buffer. A background thread batches events to the collector using Protobuf messages. Disassembly, normalization, window scheduling, and inference run off the application thread.
+
+\subsection{Transparent CUDA Activity Capture}
+\label{sec:capture}
+
+The capture layer exists because every CUDA miner must eventually load GPU code and launch kernels through the CUDA software stack. GPU-Sentry intercepts the CUDA Driver API, which sits below the CUDA Runtime API, CUDA libraries, and many GPU frameworks. This boundary gives the system visibility across native programs and containers without requiring application source changes.
+
+GPU-Sentry deploys a replacement \texttt{libcuda.so.1} that exposes the expected CUDA driver symbols and forwards calls to the original driver implementation. Non-intercepted symbols use trampolines that jump directly to the original implementation, preserving calling conventions and avoiding per-instruction instrumentation. Compared with dynamic GPU binary instrumentation, this design is more suitable for continuous monitoring because it avoids instrumenting every executed instruction and can be deployed through the same driver-library path used by containerized CUDA workloads.
+
+GPU-Sentry captures code objects by intercepting CUDA module and library load paths, including \texttt{cuModuleLoad}, \texttt{cuModuleLoadData}, \texttt{cuModuleLoadDataEx}, \texttt{cuModuleLoadFatBinary}, \texttt{cuLibraryLoadData}, and \texttt{cuLibraryLoadFromFile}. Captured input may be a file-backed CUBIN, an in-memory fatbin, or null-terminated PTX. If PTX is provided, GPU-Sentry compiles it to target SASS before analysis so that the detector sees the representation submitted for execution.
+
+GPU-Sentry correlates code objects with launches because kernel names are not reliable detection evidence. The capture layer records function-handle resolution through \texttt{cuModuleGetFunction} and \texttt{cuLibraryGetKernel}, then records launches through \texttt{cuLaunchKernel}, \texttt{cuLaunchKernelEx}, and \texttt{cuLaunchCooperativeKernel}. Each launch event includes process identity, device identity, stream, function handle, code identifier, launch dimensions, and timestamp. The model later sees normalized instructions, while the surrounding metadata supports windowing and attribution.
+
+\subsection{Kernel Code Normalization Pipeline}
+\label{sec:normalization}
+
+The normalization pipeline exists because raw SASS is too specific to a compiler, architecture, and binary instance. GPU-Sentry first disassembles each captured code object and extracts per-kernel instruction sequences. Short kernels keep their complete normalized sequence. For long kernels, GPU-Sentry recovers control-flow structure and selects the main computation loop so that the classifier input focuses on the recurring work rather than initialization or error-handling code.
+
+GPU-Sentry normalizes operands to remove unstable details while preserving computation. It canonicalizes registers, predicates, instruction addresses, branch labels, constant offsets, literal values, and compiler-generated symbols. It preserves opcode and operand-type information for instruction families that matter to mining and benign compute alike: integer arithmetic, bitwise logic, shifts and rotates, comparisons, branches, loads, stores, synchronization, and floating-point or tensor operations.
+
+\begin{lstlisting}[caption={Example of SASS normalization.},label={lst:normalization}]
+IADD3 R12, R13, c[0x0][0x20], RZ
+  -> IADD3 REG, REG, CONST, ZERO
+
+@P0 BRA 0x1a0
+  -> @PRED BRA LABEL
+\end{lstlisting}
+
+GPU-Sentry also maps architecture-specific opcode variants to common semantic families. This mapping does not attempt to decompile SASS into an architecture-independent language. Instead, it reduces irrelevant variation so that semantically similar integer, bitwise, memory, branch, and synchronization patterns remain comparable across generated binaries.
+
+\subsection{Dynamic Kernel Launch Sequence Window Scheduler}
+\label{sec:windows}
+
+The window scheduler exists because a mining workload is often a launch sequence, not a single isolated kernel. GPU-Sentry groups launches by process, GPU device, and CUDA stream. It does not emit process-wide aggregate windows in the current configuration, which prevents unrelated streams from being merged into one trace and keeps the detection unit aligned with CUDA ordering.
+
+The scheduler emits short windows when enough stream context has accumulated. A stream becomes mature after at least 32 launches or 1 second of activity. The first mature window is always evaluated. Later short windows are emitted when the stream shows repeated code identifiers, low launch-code entropy, stable launch shapes, a major pattern change, or a periodic safety sample. A 10-second cooldown prevents unnecessary repeated inference unless the stream changes substantially.
+
+Long windows provide coverage for persistent or low-rate streams. A long window can mature after 30 seconds and can accumulate up to 2048 launches. Before rendering, GPU-Sentry proportionally condenses repeated launch runs to at most 256 emitted launches, preserving first and last launches and giving every code-id run at least one representative when possible. For example, a stream with long contiguous runs such as \texttt{AAAAAABBBCCC} is shortened while preserving the relative run structure rather than collapsed into a single unordered histogram.
+
+Each emitted window is rendered as normalized SASS joined by explicit \texttt{KERNEL\_BOUNDARY} tokens. The L1 detector uses an 8192-token maximum sequence length; long workloads are chunked and chunk probabilities are aggregated. This representation retains local instruction semantics inside each kernel and cross-launch recurrence across the stream.
+
+\subsection{ModernBERT Instruction Sequence Detector}
+\label{sec:classifier}
+
+The detector exists because global opcode statistics are too coarse for cryptomining-like computation. GPU-Sentry uses an encoder-only ModernBERT model as a binary classifier over normalized instruction sequences. The input contains only normalized SASS and \texttt{KERNEL\_BOUNDARY} tokens; scheduling metadata such as timestamps, launch dimensions, and process names are not inserted into the model input.
+
+ModernBERT is a good fit for this setting because it can attend over the entire token window and learn both local instruction relationships and repeated cross-launch patterns. During training, GPU-Sentry first trains a tokenizer on normalized synthetic SASS, warms the model with masked-language modeling, and then trains the binary classifier. During evaluation, long rendered windows are split into 8192-token chunks. The primary label is based on the mean mining probability across chunks, and the report also records a high-recall suspicious rule based on maximum mining probability or top-3 mean probability.
+
+\subsection{Decision, Archive, and Optional Verification}
+\label{sec:decision}
+
+The decision module exists because detection output must be separated from deployment policy. Each classified window produces a mining score, a binary verdict, and the capture context needed for attribution. A deployment can log the verdict, notify an administrator, throttle a workload, or send a termination command to the client interception thread. This paper evaluates detection accuracy independently of the chosen enforcement action.
+
+GPU-Sentry archives captured code objects, normalized artifacts, window metadata, model scores, and verdicts for audit and forensic review. The archive is important because instruction-level detection produces evidence that can be inspected after an alert, unlike device-level telemetry that may only show that the GPU was busy.
+
+For deployments with stricter false-positive tolerance, GPU-Sentry can route uncertain windows to an optional verifier that reasons over un-normalized code, kernel statistics, classifier scores, and launch behavior. This verifier is not part of the evaluated decision path. In the current real-world test partition, the ModernBERT detector produces no benign false positives under both mean pooling and the high-recall suspicious rule, so the optional verifier is never invoked in our reported experiments.
+
+\subsection{Implementation}
+\label{sec:implementation}
+
+The capture library is implemented in C++ with a Go client bridge for event export. The collector server is implemented in Go, and the offline analysis and ModernBERT training pipeline are implemented in Python. GPU-Sentry uses Protobuf messages between the client and collector, stores raw and normalized artifacts on disk, and uses the same capture path for dataset construction and deployment-mode experiments.
+
+\section{Dataset and Training}
+\label{sec:dataset}
+
+\subsection{Synthetic-to-Real Protocol}
+
+GPU-Sentry uses a synthetic-to-real protocol to test transfer rather than memorization. The tokenizer, masked-language model, and classifier are trained on synthetic normalized SASS. Synthetic validation data is used for model selection and thresholding. Real-world captures are never used for tokenizer training, model training, validation, threshold tuning, or model selection.
+
+The real-world dataset is stored with train, validation, and test split files because the tooling reuses the same manifest format as the synthetic dataset. In this paper, all real-world splits are evaluation partitions. We report the real-world test partition as the main result and use the other real-world partitions only for additional inspection of transfer behavior.
+
+\subsection{Synthetic Workloads}
+
+The synthetic dataset contains 252 captured workloads, evenly split across O2 and O3 builds. It includes 130 mining-like workloads and 122 benign workloads. The mining workloads cover ethash and DAG-based mining, ProgPoW/KawPoW-style random math, CryptoNight/RandomX-style scratchpad access, Cuckoo graph search, Equihash solvers, memory-hard table hashes, multi-hash chains, modern alternative proof-of-work algorithms, heavyhash-like kernels, and pure hash nonce search. The benign workloads cover HPC kernels, AI kernels, graph kernels, image and signal processing, compression, memory benchmarks, CUDA samples, and benign cryptographic or checksum kernels.
+
+\begin{table}[t]
+    \centering
+    \caption{Synthetic normalized-SASS dataset used for training and synthetic validation/testing.}
+    \label{tab:synthetic_dataset}
+    \footnotesize
+    \begin{tabular}{lrrr}
+        \toprule
+        Label & Total & Train & Val/Test \\
+        \midrule
+        Benign compute-like & 80 & 56 & 12 / 12 \\
+        Benign crypto/hash-like & 28 & 20 & 4 / 4 \\
+        Benign memory-like & 14 & 10 & 2 / 2 \\
+        Mining-like & 130 & 91 & 20 / 19 \\
+        \midrule
+        \textbf{Total} & \textbf{252} & \textbf{177} & \textbf{38 / 37} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Benign crypto-like workloads are included deliberately. They create a difficult negative class because cryptographic primitives and checksums can be dominated by integer and bitwise instructions that resemble proof-of-work computation. This class helps reveal whether the detector has learned only a simplistic association between bit-mixing code and mining.
+
+\subsection{Real-World Captures}
+
+The real-world dataset contains 77 captures collected through the same runtime capture layer used by GPU-Sentry. After skipping 17 empty captures and one unmapped capture, the build produces 59 workload groups and 316 L0 windows. These windows include 49 mining-like workload groups and 10 benign workload groups. The real-world test partition contains 46 windows from 9 workload groups: 20 benign windows from AI and compression workloads, and 26 mining windows from ethash, modern alternative proof-of-work, and ProgPoW/KawPoW families.
+
+\begin{table}[t]
+    \centering
+    \caption{Real-world normalized-SASS evaluation dataset. All partitions are evaluation-only; no real-world row is used for training or tuning.}
+    \label{tab:realworld_dataset}
+    \footnotesize
+    \begin{tabular}{lrrrr}
+        \toprule
+        Partition & Windows & Groups & Benign & Mining \\
+        \midrule
+        Evaluation A & 221 & 40 & 80 & 141 \\
+        Evaluation B & 49 & 10 & 15 & 34 \\
+        Evaluation C (reported test) & 46 & 9 & 20 & 26 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+The evaluation asks four questions: whether GPU-Sentry captures representative CUDA activity, whether synthetic training transfers to real-world SASS windows, whether instruction-level detection is robust to launch-rate throttling compared with a telemetry baseline, and what overhead transparent capture introduces.
+
+\subsection{Experimental Setup}
+
+Experiments run on a server with two Intel Xeon Silver 4314 CPUs, 188 GiB RAM, and eight NVIDIA V100 GPUs. The software stack uses Debian 12, Linux 6.1.0, NVIDIA driver 580.65.06, and CUDA 12.8. The behavioral baseline is a Pott-style Random Forest over whole-device point measurements from \texttt{nvidia-smi}: GPU utilization, memory utilization, power usage, and temperature. It predicts a mining probability for each sample and raises a run-level alarm when the mean mining probability is at least 0.8, a threshold tuned on the validation split with a maximum benign false-positive rate of 0.01.
+
+\subsection{Capture Effectiveness}
+
+GPU-Sentry must first show that transparent capture observes real CUDA activity across benign and mining workloads. \Cref{tab:top_kernels} reports the three most frequently launched named kernels in representative vLLM, HPL, and T-Rex captures. GPU-Sentry captures AI serving kernels, dense linear algebra kernels, and mining search kernels through the same Driver API path. The T-Rex capture is particularly useful because a real miner still exposes SASS code and launch events even if host-level names or binaries are less informative.
+
+\begin{table*}[t]
+    \centering
+    \caption{Top launched named kernels from representative captures. Compute ratio is the fraction of parsed SASS instructions in compute opcode families.}
+    \label{tab:top_kernels}
+    \footnotesize
+    \begin{tabular}{llrrr}
+        \toprule
+        Workload & Kernel & Launches/s & Instr. & Compute ratio \\
+        \midrule
+        vLLM & \texttt{reshape\_and\_cache\_kernel\_flash} & 132.758 & 50 & 0.680 \\
+        vLLM & \texttt{triton\_red\_fused\_...} & 127.371 & 158 & 0.753 \\
+        vLLM & \texttt{triton\_poi\_fused\_...} & 127.320 & 143 & 0.881 \\
+        HPL & \texttt{volta\_dgemm\_128x64\_nt} & 42.471 & 1054 & 0.793 \\
+        HPL & \texttt{trsm\_right\_kernel<...,true>} & 41.683 & 198 & 0.576 \\
+        HPL & \texttt{trsm\_right\_kernel<...,false>} & 41.683 & 184 & 0.516 \\
+        T-Rex & \texttt{cuda\_ethash\_search} & 57.796 & 1512 & 0.854 \\
+        T-Rex & \texttt{cuda\_ethash\_search\_1} & 29.190 & 1555 & 0.849 \\
+        T-Rex & \texttt{cuda\_ethash\_search\_2} & 29.044 & 2088 & 0.800 \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsection{Synthetic-to-Real Detection}
+
+GPU-Sentry transfers from synthetic training data to real-world captures. On the real-world test partition, mean-pooled ModernBERT classification reaches 0.913 accuracy and 0.913 macro F1. It produces no benign false positives and misses four mining windows. Those four misses contain sparse high-confidence mining chunks whose evidence is diluted by mean pooling, so the high-recall suspicious rule catches all 26 mining windows while still producing no benign false positives in the test partition.
+
+\begin{table}[t]
+    \centering
+    \caption{Real-world binary test results for GPU-Sentry. Rows are ground truth and columns are predictions.}
+    \label{tab:realworld_detection}
+    \footnotesize
+    \begin{tabular}{llrr}
+        \toprule
+        Decision rule & True label & Pred. benign & Pred. mining \\
+        \midrule
+        Mean pooling & Benign & 20 & 0 \\
+        Mean pooling & Mining & 4 & 22 \\
+        \midrule
+        Suspicious rule & Benign & 20 & 0 \\
+        Suspicious rule & Mining & 0 & 26 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The synthetic four-class report provides a useful sanity check on failure modes. It reaches 0.842 accuracy and classifies all 20 synthetic mining test workloads as mining-like, but it flags all four benign crypto/hash-like test workloads as mining-like. This result is expected for a security detector that sees hash-heavy code but lacks deployment context. GPU-Sentry therefore treats the model output as evidence of mining-like computation, while administrator policy decides whether a flagged workload is unauthorized.
+
+\subsection{Telemetry Baseline}
+
+The behavioral baseline is strong on ordinary isolated runs but brittle under timing and concurrency stress. On the normal run-level test split, the Random Forest reaches 0.980 accuracy, with 22/22 benign runs classified benign and 27/28 mining runs classified mining. The single missed mining run has intermittent mining-like samples, but the mean mining probability remains below the 0.8 alarm threshold.
+
+\begin{table}[t]
+    \centering
+    \caption{Behavioral baseline on ordinary isolated test runs. The run-level policy averages pointwise mining probability over time.}
+    \label{tab:behavior_normal}
+    \footnotesize
+    \begin{tabular}{lrrr}
+        \toprule
+        True label & Runs & Pred. benign & Pred. mining \\
+        \midrule
+        Benign & 22 & 22 & 0 \\
+        Mining & 28 & 1 & 27 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Launch-Rate Throttling}
+
+Launch-rate throttling affects telemetry more than instruction-level detection. GPU-Sentry evaluates 288 L0 windows from throttled mining captures covering ethash/DAG-Keccak, ProgPoW/KawPoW random math, CryptoNight/RandomX scratchpad, and pure hash nonce search. All 288 windows are classified as mining. This stress set contains only mining rows, so it measures throttled mining recall rather than false-positive behavior.
+
+\begin{table}[t]
+    \centering
+    \caption{Kernel-launch throttling results. GPU-Sentry uses SASS windows; the behavioral baseline uses whole-device counters.}
+    \label{tab:throttle}
+    \footnotesize
+    \begin{tabular}{lrrr}
+        \toprule
+        Method & Unit & Detected / Total & Recall \\
+        \midrule
+        GPU-Sentry & L0 windows & 288 / 288 & 1.000 \\
+        Behavioral baseline & Runs & 23 / 48 & 0.479 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The behavioral baseline detects all runs at the 5\% and 100\% launch-rate settings, but misses every run at 25\%, 50\%, and 75\%, and misses one of eight runs at 10\%. Mid-rate throttling moves utilization and power into less distinctive regimes, while GPU-Sentry still sees the mining kernel instructions when a window is inspected.
+
+\subsection{Mixed-Workload Stress for Telemetry}
+
+The checked-in mixed-workload artifacts evaluate the behavioral baseline on concurrent benign-plus-mining runs. The baseline has no PID or stream attribution in this setting, so it can only label the whole device as mining-present or benign. It detects 2/7 mining-present mixed runs. When six benign control runs are added, it raises no benign false alarms but still detects only 2/7 mining-present runs, for 0.615 accuracy and 0.643 balanced accuracy.
+
+These mixed results are not reported as a GPU-Sentry mixed-workload confusion matrix because the repository currently contains behavioral mixed reports only. They nevertheless show why stream-level attribution matters: device-level counters can be dominated by the benign workload, while a code-level detector is designed to keep mining and benign streams separate until verdict time.
+
+\subsection{Capture Overhead}
+
+GPU-Sentry's capture path adds small API latency in the measured Driver API microbenchmark. \Cref{tab:api_overhead} reports medians over 100 runs of a vector-add program. The jump-only \texttt{cuDeviceGetCount} path adds about 0.131 microseconds. Module load adds about 68.665 microseconds because GPU-Sentry records the loaded code object. Kernel launch adds about 9.780 microseconds with asynchronous buffering.
+
+\begin{table}[t]
+    \centering
+    \caption{Median CUDA Driver API latency with and without capture.}
+    \label{tab:api_overhead}
+    \footnotesize
+    \begin{tabular}{lrrr}
+        \toprule
+        API call & Native ($\mu$s) & Capture ($\mu$s) & Added ($\mu$s) \\
+        \midrule
+        \texttt{cuDeviceGetCount} & 2.575 & 2.706 & 0.131 \\
+        \texttt{cuModuleLoad} & 133.819 & 202.484 & 68.665 \\
+        \texttt{cuLaunchKernel} & 25.302 & 35.081 & 9.780 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Application-level measurements show no measurable slowdown for the representative workloads in the checked-in results. HPL reports 3608 GFLOP/s without capture and 3721 GFLOP/s with capture, which is within run-to-run variation. T-Rex reports the same 90.75 MH/s with and without capture, and vLLM reports 1827.68 tokens/s without capture versus 1827.91 tokens/s with capture.
+
+\begin{table}[t]
+    \centering
+    \caption{Application throughput with and without capture. Values are from the checked-in capture experiment summary.}
+    \label{tab:app_overhead}
+    \footnotesize
+    \begin{tabular}{llrr}
+        \toprule
+        Workload & Metric & Native & Capture \\
+        \midrule
+        HPL & GFLOP/s & 3608 & 3721 \\
+        T-Rex & MH/s & 90.75 & 90.75 \\
+        vLLM & tokens/s & 1827.68 & 1827.91 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\section{Limitations}
+\label{sec:limitations}
+
+GPU-Sentry's main deployment limitation is the userspace enforcement boundary. The CUDA Driver API is a userspace library interface, so a knowledgeable same-privilege user could try to ship a private \texttt{libcuda.so.1}, call lower-level driver interfaces directly, or tamper with the monitored library. Closing this gap requires host policy that restricts GPU command-buffer access so only the monitored driver path can reach the kernel driver.
+
+GPU code obfuscation can also weaken instruction-level detection. Heavy obfuscation changes the instruction stream and may hide mining-like structure, but it can also impose a performance cost on a workload whose profit depends on throughput. GPU-Sentry does not assume that obfuscation is impossible; it treats obfuscated or low-confidence cases as a reason for additional verification and audit rather than as solved by the current detector.
+
+The current evaluation is intentionally narrower than a complete deployment study. The throttling experiment contains only mining rows, so it measures mining recall rather than false-positive behavior. The mixed-workload artifacts currently cover the behavioral baseline but not GPU-Sentry's stream-attributed ModernBERT detector. The paper therefore claims strong evidence for synthetic-to-real detection and throttled mining recall, while treating full mixed-workload GPU-Sentry evaluation as future artifact expansion.
+
+\section{Related Work}
+
+\subsection{GPU Cryptojacking Detection}
+
+GPU cryptojacking detectors commonly use behavior, telemetry, or counters as evidence. These methods are practical because they can monitor a device without inspecting program code. Their limitation is that they infer intent from effects: high utilization, power draw, repeated launches, or counter patterns. GPU-Sentry differs by capturing the submitted GPU instruction stream and classifying normalized code-level windows.
+
+\subsection{GPU Monitoring, Tracing, and Profiling}
+
+GPU observability tools such as DCGM, Nsight Systems, and CUPTI expose valuable performance and runtime signals~\cite{dcgm,nsight-systems,cutpi}. These tools support profiling, debugging, and cluster monitoring, but they are not designed to decide whether a submitted SASS window implements mining-like computation. GPU-Sentry uses runtime capture for security classification and keeps code objects and launch context as forensic artifacts.
+
+\subsection{GPU Binary Instrumentation}
+
+GPU binary instrumentation systems can inspect GPU execution at fine granularity, but per-instruction instrumentation is heavier than needed for continuous cryptomining detection. GPU-Sentry instead captures code-load and launch events at the Driver API boundary. This design gives up instruction-by-instruction execution tracing, but it gains a transparent deployment path for native and containerized workloads with low application overhead.
+
+\subsection{Static Host Analysis and Assembly Learning}
+
+Static cryptojacking analysis and binary representation learning show that program semantics are useful security evidence. However, host binaries and scripts may be packed, renamed, or generated by frameworks, and they do not directly reveal the final GPU SASS submitted by CUDA libraries or PTX JIT compilation. GPU-Sentry applies sequence learning to normalized GPU assembly windows, where CUDA launch order and stream context are part of the representation.
+
+\section{Ethics, Responsible Disclosure, and Artifact Availability}
+
+All experiments are performed in a controlled testbed owned by the authors. The real mining applications are run only for measurement and capture, not for live mining against third-party systems. GPU-Sentry captures executable GPU code, which may be proprietary in real deployments; administrators should define retention, access-control, redaction, and appeal policies before enabling enforcement.
+
+The artifact is organized around the same pipeline used in the paper. Workloads are under \texttt{workloads/}, datasets under \texttt{dataset/} and \texttt{dataset\_realworld/}, analysis code under \texttt{analysis/}, experiment summaries under \texttt{docs/experiments.md}, and model or baseline reports under \texttt{experiments/results/}. This organization is intended to make each table in the paper traceable to checked-in data.
+
+\section{Conclusion}
+
+This paper presents GPU-Sentry, an instruction-level detector for cryptomining-like GPU computation. The key idea is to inspect the normalized SASS submitted to the GPU, preserve stream-level launch order, and classify instruction windows rather than relying only on network, host, telemetry, or side-channel evidence. This design gives GPU-Sentry code-level evidence that remains visible when names change, host binaries are less informative, launch rates are throttled, or benign GPU work shares the device.
+
+The current evaluation supports three main findings. First, the CUDA Driver API capture layer observes representative benign and mining workloads and adds small API latency with no measurable slowdown in the checked-in HPL, T-Rex, and vLLM throughput results. Second, a ModernBERT detector trained on synthetic normalized SASS transfers to real-world test captures with no benign false positives in the reported test partition, and the high-recall suspicious rule catches all test mining windows. Third, instruction-level detection remains effective under kernel-launch throttling, while a whole-device telemetry baseline misses many throttled and mixed mining-present runs. The main next step is to expand the stream-attributed mixed-workload evaluation and harden deployment against userspace driver bypass.

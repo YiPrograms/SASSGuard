@@ -1,0 +1,125 @@
+\documentclass[sigconf]{acmart}
+
+\usepackage{subcaption}
+\usepackage{cleveref}
+\usepackage{caption}
+\usepackage{multirow}
+\usepackage{svg}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\renewcommand{\algorithmiccomment}[1]{\hfill $\triangleright$ #1}
+
+\lstdefinestyle{classic_style}{
+    basicstyle=\ttfamily\footnotesize,
+    numbers=none,
+    frame=tb,
+    framerule=0.5pt,
+    rulecolor=\color{black},
+    captionpos=b,
+    aboveskip=1.5\baselineskip,
+    belowskip=1.5\baselineskip,
+    keywordstyle=\bfseries,
+    stringstyle=\ttfamily,
+    commentstyle=\itshape\color{gray},
+    morecomment=[l]{;},
+    breaklines=true,
+    breakautoindent=true,
+    showstringspaces=false,
+    tabsize=2
+}
+\lstset{style=classic_style}
+
+\captionsetup{belowskip=0pt}
+\setlength{\textfloatsep}{3pt}
+
+%% ===== Submission formatting =====
+%% Replace these settings with the conference-provided metadata after acceptance.
+\setcopyright{none}
+\settopmatter{printacmref=false, printccs=true, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+% For lowercase references
+\crefname{figure}{figure}{figures}
+\crefname{section}{section}{sections}
+\crefname{table}{table}{tables}
+\crefname{algorithm}{algorithm}{algorithms}
+\crefname{lstlisting}{listing}{listings}
+
+% For uppercase references
+\Crefname{figure}{Figure}{Figures}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\Crefname{algorithm}{Algorithm}{Algorithms}
+\Crefname{lstlisting}{Listing}{Listings}
+
+\begin{document}
+\fancyhead{}
+
+\title{GPU-Sentry: Instruction-Level Semantic Detection of GPU Cryptomining Workloads}
+
+\author{Pin-Yi Kuo}
+\affiliation{%
+  \institution{National Tsing Hua University}
+  \city{Hsinchu}
+  \country{Taiwan}
+}
+\email{yikuo@lsalab.cs.nthu.edu.tw}
+
+\author{Jerry Chou}
+\affiliation{%
+  \institution{National Tsing Hua University}
+  \city{Hsinchu}
+  \country{Taiwan}
+}
+\email{jchou@lsalab.cs.nthu.edu.tw}
+
+\begin{abstract}
+Unauthorized GPU cryptomining consumes expensive accelerator resources and can interfere with legitimate HPC and AI workloads. Existing GPU cryptojacking defenses primarily rely on indirect evidence such as network traffic, host behavior, or GPU telemetry. These signals can reveal abnormal activity, but they do not directly inspect the GPU kernels submitted for execution.
+
+We present GPU-Sentry, a system for instruction-level semantic detection of GPU cryptomining workloads. GPU-Sentry transparently captures GPU code objects and kernel-launch events through CUDA driver interception, reconstructs and normalizes the submitted GPU assembly, and builds stream-level execution windows over the kernel launch sequence. A sequence classifier then detects mining-like computation from normalized instruction traces. The capture layer is deployed system-wide by the administrator and monitors native and containerized CUDA workloads without requiring user-side application changes.
+
+GPU-Sentry is designed around a synthetic-to-real evaluation setting: the detector is trained on synthetic mining and benign kernels and evaluated on real-world GPU captures. We show that normalized GPU instruction traces carry evidence of cryptomining that transfers from synthetic training to real-world captures, and that this evidence stays visible under launch-rate throttling and mixed workloads where a behavior-based GPU-telemetry baseline degrades.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+   <concept>
+       <concept_id>10002978.10003006</concept_id>
+       <concept_desc>Security and privacy~Systems security</concept_desc>
+       <concept_significance>500</concept_significance>
+   </concept>
+   <concept>
+       <concept_id>10010520.10010521.10010542.10010546</concept_id>
+       <concept_desc>Computer systems organization~Heterogeneous (hybrid) systems</concept_desc>
+       <concept_significance>500</concept_significance>
+   </concept>
+   <concept>
+       <concept_id>10002978.10003006.10003007</concept_id>
+       <concept_desc>Security and privacy~Operating systems security</concept_desc>
+       <concept_significance>300</concept_significance>
+   </concept>
+ </ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Security and privacy~Systems security}
+\ccsdesc[500]{Computer systems organization~Heterogeneous (hybrid) systems}
+\ccsdesc[300]{Security and privacy~Operating systems security}
+
+\keywords{GPU security, cryptomining detection, CUDA, GPU assembly, SASS, runtime monitoring, machine learning}
+
+\maketitle
+
+\input{body}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{reference}
+
+\end{document}
+\endinput
