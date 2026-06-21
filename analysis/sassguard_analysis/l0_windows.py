@@ -1,9 +1,9 @@
-"""Dynamic L0 launch-window scheduling from CUDA kernel launch metadata."""
+"""Rolling-window L0 launch scheduling from READY CUDA kernel launches."""
 
 from __future__ import annotations
 
 import math
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -14,11 +14,13 @@ from .l0_config import L0WindowConfig
 @dataclass
 class StreamState:
     group_key: dict[str, Any]
-    short_launches: list[dict[str, Any]] = field(default_factory=list)
-    long_launches: list[dict[str, Any]] = field(default_factory=list)
-    has_been_analyzed: bool = False
-    last_l1_timestamp_ns: int | None = None
-    last_signature: dict[str, Any] | None = None
+    launches: deque[dict[str, Any]] = field(default_factory=deque)
+    cost: int = 0
+    counts: Counter[str] = field(default_factory=Counter)
+    ratios: dict[str, float] = field(default_factory=dict)
+    seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] = field(default_factory=set)
+    evicted_launches: int = 0
+    dropped_unready_launches: int = 0
 
 
 @dataclass(frozen=True)
@@ -42,270 +44,203 @@ class L0Window:
         return payload
 
 
-def build_l0_windows(launches: list[dict[str, Any]], config: L0WindowConfig) -> list[L0Window]:
-    if not config.enabled:
-        return []
+class L0WindowScheduler:
+    """Per-stream rolling scheduler with token-budget eviction and composition dedup."""
 
-    states: dict[tuple[Any, ...], StreamState] = {}
-    windows: list[L0Window] = []
-    for launch in _sorted_launches(launches):
-        key = _group_tuple(launch, include_tid=config.grouping.include_tid_in_group)
-        state = states.setdefault(
+    def __init__(self, config: L0WindowConfig):
+        self.config = config
+        self.states: dict[tuple[Any, ...], StreamState] = {}
+        self.next_window_index = 0
+
+    def add_launch(self, launch: dict[str, Any]) -> list[L0Window]:
+        if not self.config.enabled:
+            return []
+        emitted = self._add_launch_unassigned(launch)
+        return [self._assign_window_id(window) for window in emitted]
+
+    def add_launches(self, launches: list[dict[str, Any]], *, sort: bool = False) -> list[L0Window]:
+        rows = _sorted_launches(launches) if sort else launches
+        windows: list[L0Window] = []
+        for launch in rows:
+            windows.extend(self.add_launch(launch))
+        return windows
+
+    def flush(self) -> list[L0Window]:
+        if not self.config.enabled:
+            return []
+        emitted: list[L0Window] = []
+        for state in self.states.values():
+            window = self._candidate_window(state, trigger="offline_final_flush")
+            if window is not None:
+                emitted.append(self._assign_window_id(window))
+        return emitted
+
+    def _add_launch_unassigned(self, launch: dict[str, Any]) -> list[L0Window]:
+        key = _group_tuple(launch, include_tid=self.config.grouping.include_tid_in_group)
+        state = self.states.setdefault(
             key,
-            StreamState(_group_key_from_tuple(key, include_tid=config.grouping.include_tid_in_group)),
+            StreamState(_group_key_from_tuple(key, include_tid=self.config.grouping.include_tid_in_group)),
         )
-        state.short_launches.append(launch)
-        state.long_launches.append(launch)
+        ready = ready_launch_attributes(launch)
+        if ready is None:
+            state.dropped_unready_launches += 1
+            return []
 
-        if should_evaluate_short_window(state.short_launches, state, config):
-            short_features = launch_features(state.short_launches)
-            trigger = trigger_reasons(state, short_features, config)
-            if trigger:
-                windows.append(
-                    make_window(
-                        state,
-                        state.short_launches,
-                        "short",
-                        trigger,
-                        "full_short_window",
-                        config,
-                    )
-                )
-                state.has_been_analyzed = True
-                state.last_l1_timestamp_ns = _timestamp_ns(launch)
-                state.last_signature = pattern_signature(short_features, state.short_launches)
-                state.short_launches = []
-                continue
+        row = dict(launch)
+        kernel_id = ready["kernel_id"]
+        token_cost = ready["token_cost"]
+        ratio = ready["bitwise_integer_ratio"]
+        row["l0_kernel_id"] = kernel_id
+        row["l0_token_cost"] = token_cost
+        row["l0_bitwise_integer_ratio"] = ratio
+        state.launches.append(row)
+        state.cost += token_cost
+        state.counts[kernel_id] += 1
+        state.ratios[kernel_id] = ratio
 
-        if should_roll_short_window(state.short_launches, config):
-            state.short_launches = []
+        budget = self.config.window.content_token_budget
+        if state.cost <= budget:
+            return []
 
-        long_window = maybe_emit_long_window(state, config)
-        if long_window is not None:
-            windows.append(long_window)
-            state.last_l1_timestamp_ns = _timestamp_ns(launch)
-            state.last_signature = pattern_signature(long_window.features, state.long_launches)
-            state.long_launches = []
-
-    return assign_window_ids(windows)
-
-
-def should_evaluate_short_window(
-    launches: list[dict[str, Any]],
-    state: StreamState,
-    config: L0WindowConfig,
-) -> bool:
-    if not launches:
-        return False
-    launch_count = len(launches)
-    duration = window_duration_ms(launches)
-    mature = launch_count >= config.maturity.min_launches or duration >= config.maturity.min_duration_ms
-    if not mature:
-        return False
-    if not state.has_been_analyzed:
-        return True
-    return (
-        launch_count % 16 == 0
-        or duration >= config.short_window.duration_ms
-        or launch_count >= config.short_window.max_launches
-        or periodic_sample_due(state, launches, config)
-    )
-
-
-def trigger_reasons(
-    state: StreamState,
-    features: dict[str, Any],
-    config: L0WindowConfig,
-) -> list[str]:
-    if not is_mature_features(features, config):
-        return []
-    major_change = is_major_pattern_change(state, features, state.short_launches, config)
-    if in_cooldown(state, state.short_launches, config) and not (
-        major_change and major_change_interval_elapsed(state, state.short_launches, config)
-    ):
+        before_eviction_count = state.evicted_launches
+        window = self._candidate_window(state, trigger="token_budget_overflow")
+        self._evict_to_budget(state)
+        post_emit_evicted = state.evicted_launches - before_eviction_count
+        if window is not None:
+            window.features["post_emit_evicted_launches"] = post_emit_evicted
+            return [window]
         return []
 
-    reasons: list[str] = []
-    if not state.has_been_analyzed:
-        reasons.append("first_mature_window")
-    if features["dominant_code_id_ratio"] >= config.repetition.dominant_code_id_ratio:
-        reasons.append("dominant_code_id_ratio")
-    if features["top3_code_id_ratio"] >= config.repetition.top3_code_id_ratio:
-        reasons.append("top3_code_id_ratio")
-    if features["normalized_entropy"] <= config.repetition.normalized_entropy:
-        reasons.append("normalized_entropy")
-    if (
-        features["launch_count"] >= config.trigger.stable_shape_min_launches
-        and features["grid_stability"] >= config.trigger.grid_stability
-        and features["block_stability"] >= config.trigger.block_stability
-    ):
-        reasons.append("stable_launch_shape")
-    if major_change:
-        reasons.append("major_pattern_change")
-    if periodic_sample_due(state, state.short_launches, config):
-        reasons.append("periodic_safety_sample")
-    return reasons
+    def _candidate_window(self, state: StreamState, trigger: str) -> L0Window | None:
+        if not state.launches or not state.counts:
+            return None
 
+        max_ratio = max(state.ratios[kernel_id] for kernel_id in state.counts)
+        gate_enabled = self.config.trigger.use_bitwise_gate
+        if gate_enabled and max_ratio < self.config.trigger.bitwise_integer_ratio_threshold:
+            return None
 
-def should_roll_short_window(launches: list[dict[str, Any]], config: L0WindowConfig) -> bool:
-    if not launches:
-        return False
-    return (
-        window_duration_ms(launches) >= config.short_window.duration_ms
-        or len(launches) >= config.short_window.max_launches
-    )
+        signature = composition_signature(state.counts)
+        if signature in state.seen_signatures:
+            return None
+        state.seen_signatures.add(signature)
 
-
-def maybe_emit_long_window(state: StreamState, config: L0WindowConfig) -> L0Window | None:
-    launches = state.long_launches
-    if not launches:
-        return None
-    duration = window_duration_ms(launches)
-    if duration < config.maturity.long_min_duration_ms:
-        return None
-    features = launch_features(launches)
-    if not is_mature_features(features, config):
-        return None
-    selected, condensation = proportional_condense_launches(
-        launches,
-        config.long_window.max_emitted_launches,
-    )
-    return L0Window(
-        window_id="",
-        window_type="long",
-        group_kind="stream",
-        group_key=state.group_key,
-        launches=selected,
-        features=features,
-        trigger_reason=["long_window_safety_sample"],
-        packing_mode="proportional_long_window",
-        condensation=condensation,
-    )
-
-
-def make_window(
-    state: StreamState,
-    launches: list[dict[str, Any]],
-    window_type: str,
-    trigger_reason: list[str],
-    packing_mode: str,
-    config: L0WindowConfig,
-) -> L0Window:
-    selected = list(launches)
-    condensation = {
-        "enabled": False,
-        "applied": False,
-        "original_launch_count": len(launches),
-        "selected_launch_count": len(selected),
-    }
-    if window_type == "long":
-        selected, condensation = proportional_condense_launches(
-            launches,
-            config.long_window.max_emitted_launches,
+        launches = list(state.launches)
+        return L0Window(
+            window_id="",
+            window_type="dynamic",
+            group_kind="stream",
+            group_key=state.group_key,
+            launches=launches,
+            features={
+                **launch_features(launches),
+                "token_cost": state.cost,
+                "pre_clip_token_cost": state.cost,
+                "content_token_budget": self.config.window.content_token_budget,
+                "kernel_set": list(signature[0]),
+                "top3_kernels": list(signature[1]),
+                "max_bitwise_integer_ratio": max_ratio,
+                "bitwise_integer_gate_enabled": gate_enabled,
+                "bitwise_integer_ratio_threshold": self.config.trigger.bitwise_integer_ratio_threshold,
+                "distinct_kernel_count": len(state.counts),
+                "evicted_launches": state.evicted_launches,
+                "dropped_unready_launches": state.dropped_unready_launches,
+                "post_emit_evicted_launches": 0,
+                "front_clipped": False,
+                "composition_signature": {
+                    "kernel_set": list(signature[0]),
+                    "top3": list(signature[1]),
+                },
+            },
+            trigger_reason=[
+                "int_bitwise_gate" if gate_enabled else "int_bitwise_gate_disabled",
+                "composition_signature_new",
+                trigger,
+            ],
+            packing_mode="rolling_token_window",
+            condensation={
+                "enabled": False,
+                "applied": False,
+                "original_launch_count": len(launches),
+                "selected_launch_count": len(launches),
+            },
         )
-    return L0Window(
-        window_id="",
-        window_type=window_type,
-        group_kind="stream",
-        group_key=state.group_key,
-        launches=selected,
-        features=launch_features(launches),
-        trigger_reason=trigger_reason,
-        packing_mode=packing_mode,
-        condensation=condensation,
-    )
+
+    def _evict_to_budget(self, state: StreamState) -> None:
+        budget = self.config.window.content_token_budget
+        while state.launches and state.cost > budget:
+            evicted = state.launches.popleft()
+            evicted_id = str(evicted["l0_kernel_id"])
+            state.cost -= int(evicted["l0_token_cost"])
+            state.counts[evicted_id] -= 1
+            if state.counts[evicted_id] <= 0:
+                del state.counts[evicted_id]
+                state.ratios.pop(evicted_id, None)
+            state.evicted_launches += 1
+
+    def _assign_window_id(self, window: L0Window) -> L0Window:
+        assigned = L0Window(
+            window_id=f"w{self.next_window_index:04d}_{window.window_type}_stream",
+            window_type=window.window_type,
+            group_kind=window.group_kind,
+            group_key=window.group_key,
+            launches=window.launches,
+            features=window.features,
+            trigger_reason=window.trigger_reason,
+            packing_mode=window.packing_mode,
+            condensation=window.condensation,
+        )
+        self.next_window_index += 1
+        return assigned
 
 
-def is_mature_features(features: dict[str, Any], config: L0WindowConfig) -> bool:
-    return (
-        features["launch_count"] >= config.maturity.min_launches
-        or features["duration_ms"] >= config.maturity.min_duration_ms
-    )
+def build_l0_windows(launches: list[dict[str, Any]], config: L0WindowConfig) -> list[L0Window]:
+    scheduler = L0WindowScheduler(config)
+    windows = scheduler.add_launches(launches, sort=True)
+    windows.extend(scheduler.flush())
+    return windows
 
 
-def in_cooldown(state: StreamState, launches: list[dict[str, Any]], config: L0WindowConfig) -> bool:
-    if state.last_l1_timestamp_ns is None or not launches:
-        return False
-    current = _timestamp_ns(launches[-1])
-    if current is None:
-        return False
-    return (current - state.last_l1_timestamp_ns) / 1_000_000.0 < config.trigger.cooldown_ms
-
-
-def periodic_sample_due(state: StreamState, launches: list[dict[str, Any]], config: L0WindowConfig) -> bool:
-    if state.last_l1_timestamp_ns is None or not launches:
-        return False
-    current = _timestamp_ns(launches[-1])
-    if current is None:
-        return False
-    return (current - state.last_l1_timestamp_ns) / 1_000_000.0 >= config.trigger.periodic_sample_ms
-
-
-def major_change_interval_elapsed(
-    state: StreamState,
-    launches: list[dict[str, Any]],
-    config: L0WindowConfig,
-) -> bool:
-    if state.last_l1_timestamp_ns is None or not launches:
-        return False
-    current = _timestamp_ns(launches[-1])
-    if current is None:
-        return False
-    return (current - state.last_l1_timestamp_ns) / 1_000_000.0 >= config.trigger.major_change_min_interval_ms
-
-
-def is_major_pattern_change(
-    state: StreamState,
-    features: dict[str, Any],
-    launches: list[dict[str, Any]],
-    config: L0WindowConfig,
-) -> bool:
-    if not state.last_signature:
-        return False
-    signature = pattern_signature(features, launches)
-    previous = state.last_signature
-    if signature["dominant_code_id"] != previous.get("dominant_code_id"):
-        return True
-    previous_top3 = set(previous.get("top3_code_ids") or [])
-    current_top3 = set(signature["top3_code_ids"])
-    union = previous_top3 | current_top3
-    jaccard = len(previous_top3 & current_top3) / len(union) if union else 1.0
-    if jaccard <= config.trigger.top3_jaccard_threshold:
-        return True
-    if (
-        signature["dominant_grid"] != previous.get("dominant_grid")
-        and features["grid_stability"] >= config.trigger.shape_change_min_stability
-        and float(previous.get("grid_stability", 0.0)) >= config.trigger.shape_change_min_stability
-    ):
-        return True
-    if (
-        signature["dominant_block"] != previous.get("dominant_block")
-        and features["block_stability"] >= config.trigger.shape_change_min_stability
-        and float(previous.get("block_stability", 0.0)) >= config.trigger.shape_change_min_stability
-    ):
-        return True
-    return abs(signature["normalized_entropy"] - float(previous.get("normalized_entropy", 0.0))) >= config.trigger.entropy_shift
-
-
-def pattern_signature(features: dict[str, Any], launches: list[dict[str, Any]]) -> dict[str, Any]:
-    code_counts = Counter(str(launch.get("code_id")) for launch in launches)
-    grid_counts = Counter(_shape_key(launch.get("grid_dim")) for launch in launches)
-    block_counts = Counter(_shape_key(launch.get("block_dim")) for launch in launches)
+def ready_launch_attributes(launch: dict[str, Any]) -> dict[str, Any] | None:
+    kernel_id = launch.get("l0_kernel_id")
+    token_cost = launch.get("l0_token_cost")
+    ratio = launch.get("l0_bitwise_integer_ratio")
+    if kernel_id is None or token_cost is None or ratio is None:
+        return None
+    try:
+        token_cost_int = int(token_cost)
+        ratio_float = float(ratio)
+    except (TypeError, ValueError):
+        return None
+    if token_cost_int <= 0:
+        return None
     return {
-        "dominant_code_id": code_counts.most_common(1)[0][0] if code_counts else None,
-        "top3_code_ids": [code_id for code_id, _count in code_counts.most_common(3)],
-        "dominant_grid": grid_counts.most_common(1)[0][0] if grid_counts else None,
-        "dominant_block": block_counts.most_common(1)[0][0] if block_counts else None,
-        "grid_stability": features["grid_stability"],
-        "block_stability": features["block_stability"],
-        "normalized_entropy": features["normalized_entropy"],
+        "kernel_id": str(kernel_id),
+        "token_cost": token_cost_int,
+        "bitwise_integer_ratio": max(0.0, min(1.0, ratio_float)),
     }
+
+
+def composition_signature(counts: Counter[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    kernel_set = tuple(sorted(str(kernel_id) for kernel_id in counts))
+    return kernel_set, tuple(top3_kernels(counts))
+
+
+def top3_kernels(counts: Counter[str]) -> list[str]:
+    return [
+        kernel_id
+        for kernel_id, _count in sorted(
+            ((str(kernel_id), int(count)) for kernel_id, count in counts.items() if count > 0),
+            key=lambda item: (-item[1], item[0]),
+        )[:3]
+    ]
 
 
 def proportional_condense_launches(
     launches: list[dict[str, Any]],
     target_emitted_launches: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Legacy helper retained for older reports/tests; not used by rolling L0."""
     if len(launches) <= target_emitted_launches:
         return list(launches), {
             "enabled": True,
@@ -393,25 +328,6 @@ def launch_features(launches: list[dict[str, Any]]) -> dict[str, Any]:
         "launch_gap_std": gap_std,
         "launch_gap_cv": gap_std / avg_gap if avg_gap > 0 else 0.0,
     }
-
-
-def assign_window_ids(windows: list[L0Window]) -> list[L0Window]:
-    assigned = []
-    for idx, window in enumerate(windows):
-        assigned.append(
-            L0Window(
-                window_id=f"w{idx:04d}_{window.window_type}_stream",
-                window_type=window.window_type,
-                group_kind=window.group_kind,
-                group_key=window.group_key,
-                launches=window.launches,
-                features=window.features,
-                trigger_reason=window.trigger_reason,
-                packing_mode=window.packing_mode,
-                condensation=window.condensation,
-            )
-        )
-    return assigned
 
 
 def grouped_launches(

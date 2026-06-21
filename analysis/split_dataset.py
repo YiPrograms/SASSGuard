@@ -11,6 +11,7 @@ from sassguard_analysis.splits import (
     DEFAULT_RATIOS,
     SplitError,
     load_workload_records,
+    make_all_test_split,
     make_grouped_stratified_split,
     validate_splits,
     write_splits,
@@ -25,6 +26,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=DEFAULT_RATIOS["train"])
     parser.add_argument("--val-ratio", type=float, default=DEFAULT_RATIOS["val"])
     parser.add_argument("--test-ratio", type=float, default=DEFAULT_RATIOS["test"])
+    parser.add_argument(
+        "--all-test",
+        action="store_true",
+        help="put every record in test.jsonl and leave train/val empty",
+    )
     return parser.parse_args(argv)
 
 
@@ -33,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     ratios = {"train": args.train_ratio, "val": args.val_ratio, "test": args.test_ratio}
     try:
         records = load_workload_records(args.dataset_dir / "workloads", dataset_root=args.dataset_dir)
-        splits = make_grouped_stratified_split(records, seed=args.seed, ratios=ratios)
+        if args.all_test:
+            ratios = {"train": 0.0, "val": 0.0, "test": 1.0}
+            splits = make_all_test_split(records)
+        else:
+            splits = make_grouped_stratified_split(records, seed=args.seed, ratios=ratios)
         warnings = validate_splits(splits, records)
         manifest = write_splits(args.output_dir, splits, records, args.seed, ratios, warnings)
     except SplitError as exc:

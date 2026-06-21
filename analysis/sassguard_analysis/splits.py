@@ -81,6 +81,15 @@ def load_window_records(
                 "program",
                 "variant",
                 "source_capture_path",
+                "trigger_reason",
+                "max_bitwise_integer_ratio",
+                "window_token_cost",
+                "pre_clip_token_cost",
+                "rendered_token_cost",
+                "front_clipped",
+                "no_l0_window",
+                "default_prediction",
+                "default_prediction_reason",
             ):
                 if key in row:
                     record[key] = row[key]
@@ -144,6 +153,16 @@ def make_grouped_stratified_split(
         for group in sorted(split_groups[split_name], key=lambda item: item["group_id"]):
             splits[split_name].extend(sorted(group["records"], key=lambda item: item["workload"]))
     return splits
+
+
+def make_all_test_split(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Place every record in the test split for evaluation-only datasets."""
+
+    return {
+        "train": [],
+        "val": [],
+        "test": sorted(records, key=lambda item: (item["group_id"], item["workload"], item["path"])),
+    }
 
 
 def group_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:

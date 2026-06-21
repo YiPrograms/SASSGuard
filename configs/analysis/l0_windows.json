@@ -5,41 +5,11 @@
     "emit_process_aggregate_windows": false,
     "include_tid_in_group": false
   },
-  "maturity": {
-    "min_launches": 32,
-    "min_duration_ms": 1000,
-    "long_min_duration_ms": 30000
-  },
-  "short_window": {
-    "duration_ms": 5000,
-    "max_launches": 256,
-    "target_l1_chunks": 4
-  },
-  "long_window": {
-    "duration_ms": 120000,
-    "max_launches": 2048,
-    "target_l1_chunks": 12,
-    "max_emitted_launches": 256
-  },
-  "repetition": {
-    "dominant_code_id_ratio": 0.7,
-    "top3_code_id_ratio": 0.85,
-    "normalized_entropy": 0.45
+  "window": {
+    "content_token_budget": 8190
   },
   "trigger": {
-    "stable_shape_min_launches": 64,
-    "grid_stability": 0.8,
-    "block_stability": 0.8,
-    "cooldown_ms": 10000,
-    "major_change_min_interval_ms": 5000,
-    "periodic_sample_ms": 30000,
-    "entropy_shift": 0.35,
-    "top3_jaccard_threshold": 0.34,
-    "shape_change_min_stability": 0.8
-  },
-  "condensation": {
-    "enabled": true,
-    "preserve_first_last": true,
-    "min_per_code_id": 1
+    "use_bitwise_gate": true,
+    "bitwise_integer_ratio_threshold": 0.65
   }
 }

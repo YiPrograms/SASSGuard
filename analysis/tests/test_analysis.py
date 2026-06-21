@@ -13,7 +13,7 @@ from sassguard_analysis.cfg import build_cfg
 from sassguard_analysis.disassemble import detect_code_format, disassemble_code_objects
 from sassguard_analysis.ingest import copy_code_objects, event_sort_key, write_launches
 from sassguard_analysis.l0_config import L0ConfigError, load_l0_config, parse_l0_config
-from sassguard_analysis.l0_windows import build_l0_windows, launch_features, proportional_condense_launches
+from sassguard_analysis.l0_windows import L0WindowScheduler, build_l0_windows, launch_features, proportional_condense_launches
 from sassguard_analysis.loop_extract import extract_main_loop
 from build_dataset import (
     capture_spec_has_no_kernel_launch,
@@ -22,6 +22,7 @@ from build_dataset import (
 )
 from sassguard_analysis.manifest import load_binary_manifest, workload_manifest
 from sassguard_analysis.normalize import normalize_instruction, normalize_sass
+from sassguard_analysis.sass_tokens import sass_token_count
 from sassguard_analysis.splits import (
     group_id_for_workload,
     make_grouped_stratified_split,
@@ -37,7 +38,7 @@ from sassguard_analysis.split_kernels import (
     split_launched_kernels,
     unique_safe_kernel_dir,
 )
-from sassguard_analysis.workload_sass import build_workload_sass
+from sassguard_analysis.workload_sass import build_workload_sass, prepare_l0_launches, render_workload_sass
 
 
 class ManifestTests(unittest.TestCase):
@@ -207,10 +208,9 @@ class L0ConfigTests(unittest.TestCase):
         config = load_l0_config()
         self.assertTrue(config.enabled)
         self.assertFalse(config.grouping.emit_process_aggregate_windows)
-        self.assertEqual(config.short_window.max_launches, 256)
-        self.assertEqual(config.long_window.target_l1_chunks, 12)
-        self.assertEqual(config.long_window.max_emitted_launches, 256)
-        self.assertEqual(config.trigger.cooldown_ms, 10000)
+        self.assertEqual(config.window.content_token_budget, 8190)
+        self.assertTrue(config.trigger.use_bitwise_gate)
+        self.assertAlmostEqual(config.trigger.bitwise_integer_ratio_threshold, 0.65)
 
     def test_l0_config_requires_sections(self) -> None:
         with self.assertRaisesRegex(L0ConfigError, "missing sections"):
@@ -221,41 +221,45 @@ class L0ConfigTests(unittest.TestCase):
             "enabled": True,
             "grouping": {
                 "emit_stream_windows": True,
-                "emit_process_aggregate_windows": True,
+                "emit_process_aggregate_windows": False,
                 "include_tid_in_group": False,
             },
-            "maturity": {"min_launches": 0, "min_duration_ms": 1000, "long_min_duration_ms": 30000},
-            "short_window": {"duration_ms": 5000, "max_launches": 256, "target_l1_chunks": 4},
-            "long_window": {"duration_ms": 60000, "max_launches": 2048, "target_l1_chunks": 8, "max_emitted_launches": 64},
-            "repetition": {
-                "dominant_code_id_ratio": 0.7,
-                "top3_code_id_ratio": 0.85,
-                "normalized_entropy": 0.45,
-            },
-            "trigger": {
-                "stable_shape_min_launches": 64,
-                "grid_stability": 0.8,
-                "block_stability": 0.8,
-                "cooldown_ms": 10000,
-                "major_change_min_interval_ms": 5000,
-                "periodic_sample_ms": 30000,
-                "entropy_shift": 0.35,
-                "top3_jaccard_threshold": 0.34,
-                "shape_change_min_stability": 0.8,
-            },
-            "condensation": {"enabled": True, "preserve_first_last": True, "min_per_code_id": 1},
+            "window": {"content_token_budget": 8190},
+            "trigger": {"bitwise_integer_ratio_threshold": 1.1},
         }
-        with self.assertRaisesRegex(L0ConfigError, "min_launches"):
+        with self.assertRaisesRegex(L0ConfigError, "between 0 and 1"):
             parse_l0_config(raw)
 
     def test_no_l0_windowing_cli_override_is_available(self) -> None:
         args = parse_args(["--no-l0-windowing"])
         self.assertFalse(args.l0_windowing)
 
+    def test_no_l0_bitwise_gate_cli_override_is_available(self) -> None:
+        args = parse_args(["--no-l0-bitwise-gate"])
+        self.assertFalse(args.l0_bitwise_gate)
+
 
 class L0WindowTests(unittest.TestCase):
+    def test_incremental_l0_matches_batch_l0(self) -> None:
+        config = parse_l0_config(_l0_test_config())
+        launches = [
+            _launch(seq=0, stream=1, code_id=0),
+            _launch(seq=1, stream=1, code_id=0),
+            _launch(seq=2, stream=2, code_id=1),
+            _launch(seq=3, stream=2, code_id=1),
+            _launch(seq=4, stream=1, code_id=0),
+            _launch(seq=5, stream=1, code_id=0),
+        ]
+        batch = [window.to_dict() for window in build_l0_windows(launches, config)]
+        scheduler = L0WindowScheduler(config)
+        incremental = []
+        for launch in launches:
+            incremental.extend(window.to_dict() for window in scheduler.add_launch(launch))
+        incremental.extend(window.to_dict() for window in scheduler.flush())
+        self.assertEqual(incremental, batch)
+
     def test_l0_groups_by_stream_without_tid(self) -> None:
-        config = parse_l0_config(_l0_test_config(min_launches=2, short_duration_ms=1000, long_duration_ms=2000))
+        config = parse_l0_config(_l0_test_config())
         launches = [
             _launch(seq=0, tid=10, stream=1, code_id=0),
             _launch(seq=1, tid=11, stream=1, code_id=0),
@@ -263,11 +267,60 @@ class L0WindowTests(unittest.TestCase):
             _launch(seq=3, tid=13, stream=2, code_id=1),
         ]
         windows = build_l0_windows(launches, config)
-        stream_windows = [window for window in windows if window.group_kind == "stream" and window.window_type == "short"]
-        process_windows = [window for window in windows if window.group_kind == "process" and window.window_type == "short"]
+        stream_windows = [window for window in windows if window.group_kind == "stream" and window.window_type == "dynamic"]
+        process_windows = [window for window in windows if window.group_kind == "process" and window.window_type == "dynamic"]
         self.assertEqual(len(stream_windows), 2)
         self.assertEqual(len(process_windows), 0)
         self.assertNotIn("tid", stream_windows[0].group_key)
+
+    def test_l0_gate_is_inclusive_and_deduplicates_signature(self) -> None:
+        config = parse_l0_config(_l0_test_config(content_token_budget=10, threshold=0.70))
+        scheduler = L0WindowScheduler(config)
+        self.assertEqual(scheduler.add_launch(_launch(seq=0, code_id=0, ratio=0.69, token_cost=6)), [])
+        first = scheduler.add_launch(_launch(seq=1, code_id=0, ratio=0.70, token_cost=6))
+        self.assertEqual(len(first), 1)
+        self.assertAlmostEqual(first[0].features["max_bitwise_integer_ratio"], 0.70)
+        self.assertIn("token_budget_overflow", first[0].trigger_reason)
+        self.assertEqual(scheduler.add_launch(_launch(seq=2, code_id=0, ratio=0.70, token_cost=6)), [])
+
+    def test_l0_emits_pre_eviction_window_then_evicts_to_budget(self) -> None:
+        config = parse_l0_config(_l0_test_config(content_token_budget=10))
+        scheduler = L0WindowScheduler(config)
+        self.assertEqual(scheduler.add_launch(_launch(seq=0, code_id=0, token_cost=6)), [])
+        windows = scheduler.add_launch(_launch(seq=1, code_id=1, token_cost=6))
+        self.assertEqual(len(windows), 1)
+        self.assertEqual([launch["sequence"] for launch in windows[0].launches], [0, 1])
+        self.assertEqual(windows[0].features["pre_clip_token_cost"], 12)
+        self.assertEqual(windows[0].features["post_emit_evicted_launches"], 1)
+        state = next(iter(scheduler.states.values()))
+        self.assertLessEqual(state.cost, 10)
+        self.assertEqual([launch["sequence"] for launch in state.launches], [1])
+
+    def test_l0_first_under_budget_launch_does_not_emit_online(self) -> None:
+        config = parse_l0_config(_l0_test_config(content_token_budget=10))
+        scheduler = L0WindowScheduler(config)
+        self.assertEqual(scheduler.add_launch(_launch(seq=0, code_id=0, token_cost=6)), [])
+
+    def test_l0_top3_signature_is_count_desc_id_asc(self) -> None:
+        config = parse_l0_config(_l0_test_config(content_token_budget=100))
+        windows = build_l0_windows(
+            [
+                _launch(seq=0, code_id=2),
+                _launch(seq=1, code_id=1),
+                _launch(seq=2, code_id=1),
+                _launch(seq=3, code_id=0),
+                _launch(seq=4, code_id=0),
+            ],
+            config,
+        )
+        self.assertEqual(windows[-1].features["top3_kernels"], ["0:k0", "1:k1", "2:k2"])
+
+    def test_l0_drops_unready_launches(self) -> None:
+        config = parse_l0_config(_l0_test_config())
+        scheduler = L0WindowScheduler(config)
+        self.assertEqual(scheduler.add_launch({"sequence": 0, "code_id": 0}), [])
+        state = next(iter(scheduler.states.values()))
+        self.assertEqual(state.dropped_unready_launches, 1)
 
     def test_l0_features_capture_repetition(self) -> None:
         features = launch_features(
@@ -294,13 +347,18 @@ class L0WindowTests(unittest.TestCase):
         self.assertEqual([launch["code_id"] for launch in selected].count(0), 4)
         self.assertEqual([launch["code_id"] for launch in selected].count(1), 2)
 
-    def test_l0_max_launches_rolls_without_trigger(self) -> None:
-        raw = _l0_test_config(min_launches=100, short_duration_ms=100000, long_duration_ms=200000)
-        raw["short_window"]["max_launches"] = 4  # type: ignore[index]
-        config = parse_l0_config(raw)
-        launches = [_launch(seq=seq, code_id=seq % 2) for seq in range(10)]
-        windows = [window for window in build_l0_windows(launches, config) if window.window_type == "short"]
-        self.assertEqual(windows, [])
+    def test_l0_does_not_emit_below_gate(self) -> None:
+        config = parse_l0_config(_l0_test_config(threshold=0.70))
+        launches = [_launch(seq=seq, code_id=seq % 2, ratio=0.2) for seq in range(10)]
+        self.assertEqual(build_l0_windows(launches, config), [])
+
+    def test_l0_emits_below_gate_when_gate_disabled(self) -> None:
+        config = parse_l0_config(_l0_test_config(threshold=0.70, use_bitwise_gate=False))
+        windows = build_l0_windows([_launch(seq=0, code_id=0, ratio=0.2)], config)
+        self.assertEqual(len(windows), 1)
+        self.assertFalse(windows[0].features["bitwise_integer_gate_enabled"])
+        self.assertIn("int_bitwise_gate_disabled", windows[0].trigger_reason)
+        self.assertIn("offline_final_flush", windows[0].trigger_reason)
 
 
 class DisassemblyTests(unittest.TestCase):
@@ -497,6 +555,17 @@ class SassAnalysisTests(unittest.TestCase):
     def test_normalize_skips_labels(self) -> None:
         self.assertEqual(normalize_sass(["L_0:", "BRA L_0"]), "BRA LABEL\n")
 
+    def test_normalize_removes_nop_including_predicated_nop(self) -> None:
+        self.assertIsNone(normalize_instruction("NOP"))
+        self.assertIsNone(normalize_instruction("@P0 NOP"))
+        self.assertEqual(normalize_sass(["NOP", "@P0 NOP", "IADD3 R1, R2, 0x1, RZ"]), "IADD3 REG, REG, IMM, ZERO\n")
+
+    def test_normalize_bounds_main_loop_by_token_budget(self) -> None:
+        lines = ["IADD3 R1, R2, 0x1, RZ" for _ in range(10)]
+        normalized = normalize_sass(lines, token_budget=12)
+        self.assertLessEqual(sass_token_count(normalized), 12)
+        self.assertIn("IADD3 REG, REG, IMM, ZERO", normalized)
+
     def test_cfg_predicated_branch_has_fallthrough(self) -> None:
         cfg = build_cfg(["L_0:", "IADD3 R1, R1, 0x1, RZ", "@P0 BRA L_0", "EXIT"])
         edge_types = sorted(edge["type"] for edge in cfg["edges"])
@@ -589,6 +658,101 @@ class WorkloadSassTests(unittest.TestCase):
             self.assertEqual(result["included_launches"], 2)
             self.assertEqual(text.splitlines().count("KERNEL_BOUNDARY"), 2)
 
+    def test_prepare_l0_launch_counts_boundary_and_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workload = root / "demo"
+            kernel = workload / "kernels" / "k"
+            kernel.mkdir(parents=True)
+            (kernel / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "kernel_name": "k",
+                        "safe_kernel_dir": "k",
+                        "code_id": 0,
+                        "instruction_count": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (kernel / "kernel.normalized.sass").write_text(
+                "LOP3 REG, REG, REG, IMM\nLDG REG, MEM\n",
+                encoding="utf-8",
+            )
+            (kernel / "main_loop.normalized.sass").write_text("LOP3 REG, REG, REG, IMM\n", encoding="utf-8")
+            launch = {"sequence": 0, "kernel_name": "k", "code_id": 0}
+            prepared = prepare_l0_launches(workload, [launch], short_kernel_threshold=256, content_token_budget=8190)
+            ready = prepared["launches"][0]
+            rendered = render_workload_sass(workload, [ready], short_kernel_threshold=256)
+            self.assertEqual(rendered["text"].splitlines().count("KERNEL_BOUNDARY"), 1)
+            self.assertEqual(ready["l0_token_cost"], sass_token_count(rendered["text"]))
+            self.assertAlmostEqual(ready["l0_bitwise_integer_ratio"], 0.5)
+
+    def test_render_l0_window_front_clips_overflow_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workload = root / "demo"
+            kernel = workload / "kernels" / "k"
+            kernel.mkdir(parents=True)
+            (kernel / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "kernel_name": "k",
+                        "safe_kernel_dir": "k",
+                        "code_id": 0,
+                        "instruction_count": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (kernel / "kernel.normalized.sass").write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+            (kernel / "main_loop.normalized.sass").write_text("IADD3 REG, REG, IMM, ZERO\n", encoding="utf-8")
+            launches = [{"sequence": seq, "kernel_name": "k", "code_id": 0} for seq in range(2)]
+            rendered = render_workload_sass(
+                workload,
+                launches,
+                short_kernel_threshold=256,
+                content_token_budget=10,
+                front_clip_to_budget=True,
+            )
+            self.assertEqual(rendered["pre_clip_token_cost"], 18)
+            self.assertLessEqual(rendered["token_cost"], 10)
+            self.assertTrue(rendered["front_clipped"])
+            self.assertTrue(rendered["text"].rstrip().endswith("KERNEL_BOUNDARY"))
+            self.assertIn("IADD3 REG, REG, IMM, ZERO", rendered["text"])
+
+    def test_prepare_l0_launches_short_circuits_below_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workload = root / "demo"
+            kernel = workload / "kernels" / "k"
+            kernel.mkdir(parents=True)
+            (kernel / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "kernel_name": "k",
+                        "safe_kernel_dir": "k",
+                        "code_id": 0,
+                        "instruction_count": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (kernel / "kernel.normalized.sass").write_text("LDG REG, MEM\n", encoding="utf-8")
+            (kernel / "main_loop.normalized.sass").write_text("LDG REG, MEM\n", encoding="utf-8")
+            launches = [{"sequence": seq, "kernel_name": "k", "code_id": 0} for seq in range(100)]
+            prepared = prepare_l0_launches(
+                workload,
+                launches,
+                short_kernel_threshold=256,
+                content_token_budget=8190,
+                bitwise_gate_threshold=0.70,
+            )
+            self.assertEqual(prepared["launches"], [])
+            self.assertTrue(prepared["gate_short_circuit"])
+            self.assertEqual(prepared["unique_kernel_count"], 1)
+            self.assertAlmostEqual(prepared["max_bitwise_integer_ratio"], 0.0)
+
 
 class SplitTests(unittest.TestCase):
     def test_group_id_strips_final_opt_suffix(self) -> None:
@@ -676,9 +840,9 @@ class SplitTests(unittest.TestCase):
 
 
 def _l0_test_config(
-    min_launches: int = 32,
-    short_duration_ms: int = 5000,
-    long_duration_ms: int = 60000,
+    content_token_budget: int = 8190,
+    threshold: float = 0.70,
+    use_bitwise_gate: bool = True,
 ) -> dict[str, object]:
     return {
         "enabled": True,
@@ -687,42 +851,10 @@ def _l0_test_config(
             "emit_process_aggregate_windows": False,
             "include_tid_in_group": False,
         },
-        "maturity": {
-            "min_launches": min_launches,
-            "min_duration_ms": 1000,
-            "long_min_duration_ms": 30000,
-        },
-        "short_window": {
-            "duration_ms": short_duration_ms,
-            "max_launches": 256,
-            "target_l1_chunks": 4,
-        },
-        "long_window": {
-            "duration_ms": long_duration_ms,
-            "max_launches": 2048,
-            "target_l1_chunks": 8,
-            "max_emitted_launches": 64,
-        },
-        "repetition": {
-            "dominant_code_id_ratio": 0.70,
-            "top3_code_id_ratio": 0.85,
-            "normalized_entropy": 0.45,
-        },
+        "window": {"content_token_budget": content_token_budget},
         "trigger": {
-            "stable_shape_min_launches": 64,
-            "grid_stability": 0.80,
-            "block_stability": 0.80,
-            "cooldown_ms": 10000,
-            "major_change_min_interval_ms": 5000,
-            "periodic_sample_ms": 30000,
-            "entropy_shift": 0.35,
-            "top3_jaccard_threshold": 0.34,
-            "shape_change_min_stability": 0.8,
-        },
-        "condensation": {
-            "enabled": True,
-            "preserve_first_last": True,
-            "min_per_code_id": 1,
+            "use_bitwise_gate": use_bitwise_gate,
+            "bitwise_integer_ratio_threshold": threshold,
         },
     }
 
@@ -734,6 +866,8 @@ def _launch(
     code_id: int = 0,
     grid: list[int] | None = None,
     block: list[int] | None = None,
+    token_cost: int = 4,
+    ratio: float = 0.8,
 ) -> dict[str, object]:
     return {
         "sequence": seq,
@@ -747,6 +881,9 @@ def _launch(
         "shared_mem_bytes": 0,
         "stream": stream,
         "device_pci_bus_id": "0000:52:00.0",
+        "l0_kernel_id": f"{code_id}:k{code_id}",
+        "l0_token_cost": token_cost,
+        "l0_bitwise_integer_ratio": ratio,
     }
 
 

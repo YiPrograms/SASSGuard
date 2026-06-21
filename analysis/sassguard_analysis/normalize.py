@@ -5,24 +5,31 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .sass_tokens import KERNEL_BODY_TOKEN_BUDGET, truncate_lines_to_token_budget
 
-def normalize_kernel_files(kernel_dir: Path) -> None:
+
+def normalize_kernel_files(kernel_dir: Path, main_loop_token_budget: int = KERNEL_BODY_TOKEN_BUDGET) -> None:
     for raw_name, normalized_name in (
         ("kernel.sass", "kernel.normalized.sass"),
         ("main_loop.sass", "main_loop.normalized.sass"),
     ):
         raw_path = kernel_dir / raw_name
         if raw_path.exists():
-            normalized = normalize_sass(raw_path.read_text(encoding="utf-8").splitlines())
+            normalized = normalize_sass(
+                raw_path.read_text(encoding="utf-8").splitlines(),
+                token_budget=main_loop_token_budget if raw_name == "main_loop.sass" else None,
+            )
             (kernel_dir / normalized_name).write_text(normalized, encoding="utf-8")
 
 
-def normalize_sass(lines: list[str]) -> str:
+def normalize_sass(lines: list[str], token_budget: int | None = None) -> str:
     normalized = []
     for line in lines:
         instr = normalize_instruction(line)
         if instr:
             normalized.append(instr)
+    if token_budget is not None:
+        normalized = truncate_lines_to_token_budget(normalized, token_budget)
     return "\n".join(normalized).rstrip() + ("\n" if normalized else "")
 
 
@@ -42,6 +49,8 @@ def normalize_instruction(line: str) -> str | None:
         return None
     opcode, _, operands = line.partition(" ")
     opcode = opcode.split(".")[0].upper()
+    if opcode == "NOP":
+        return None
     operand_list = [_normalize_operand(op.strip(), opcode) for op in _split_operands(operands)]
     operand_list = [op for op in operand_list if op]
     if operand_list:

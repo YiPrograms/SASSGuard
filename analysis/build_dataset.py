@@ -44,6 +44,7 @@ from sassguard_analysis.validate import ValidationError, validate_workload
 from sassguard_analysis.workload_sass import (
     WorkloadSassError,
     build_workload_sass,
+    prepare_l0_launches,
     render_workload_sass,
 )
 
@@ -89,6 +90,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("dataset"))
     parser.add_argument("--l0-config", type=Path, default=DEFAULT_L0_CONFIG)
     parser.add_argument("--l0-windowing", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--l0-bitwise-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the L0 int/bitwise trigger gate. Use --no-l0-bitwise-gate "
+            "for synthetic training datasets so benign workloads still emit windows."
+        ),
+    )
     parser.add_argument("--max-launches", type=int, default=16)
     parser.add_argument("--short-kernel-threshold", type=int, default=256)
     parser.add_argument(
@@ -119,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         l0_config = load_l0_config(args.l0_config)
         if args.l0_windowing is not None:
             l0_config = l0_config.with_enabled(bool(args.l0_windowing))
+        if args.l0_bitwise_gate is not None:
+            l0_config = l0_config.with_bitwise_gate(bool(args.l0_bitwise_gate))
         args.l0_config_obj = l0_config
     except ManifestError as exc:
         print(f"[FATAL] {exc}", file=sys.stderr)
@@ -169,6 +181,12 @@ def main(argv: list[str] | None = None) -> int:
             report["unmapped_captures_skipped"] += 1
             print(f"{progress} [SKIP] {result['capture']}: {result['reason']}", flush=True)
             continue
+        if result["status"] == "skipped_no_windows":
+            report["no_l0_windows_skipped"] += 1
+            if result.get("label"):
+                report["labels"][result["label"]] += 0
+            print(f"{progress} [SKIP] {result['capture']}: {result['reason']}", flush=True)
+            continue
         if result["status"] == "dry_run":
             report["dry_run_ok"] += 1
             if args.verbose:
@@ -178,10 +196,16 @@ def main(argv: list[str] | None = None) -> int:
         created = int(result.get("workloads_created", 1))
         report["workloads_created"] += created
         report["windows_created"] += int(result.get("windows_created", 0))
+        report["no_l0_window_rows_created"] += int(result.get("no_l0_window_rows_created", 0))
         report["labels"][result["label"]] += created
         report["opt_levels"][result["opt_level"]] += created
         windows_created = int(result.get("windows_created", 0))
-        suffix = f" ({windows_created} windows)" if windows_created else ""
+        if windows_created:
+            suffix = f" ({windows_created} windows)"
+        elif result.get("no_l0_window_rows_created"):
+            suffix = " (no L0 window, default benign)"
+        else:
+            suffix = ""
         print(f"{progress} [OK] {result['workload']}{suffix}", flush=True)
 
     write_report(args.output_dir, report, dry_run=args.dry_run)
@@ -241,6 +265,7 @@ def process_capture(
     capture_dir = Path(capture_spec["capture_dir"])
     try:
         if args.skip_empty_captures and capture_spec_has_no_kernel_launch(capture_spec):
+            remove_existing_workload_if_overwriting(args, str(capture_spec["workload"]))
             return {
                 "status": "skipped_empty",
                 "workload": str(capture_spec["workload"]),
@@ -278,12 +303,7 @@ def process_capture(
                     capture_dir, temp_dir, workload, args, manifest_entry, tools
                 )
                 if created == 0:
-                    return {
-                        "status": "skipped",
-                        "workload": workload,
-                        "label": manifest_entry["label"],
-                        "opt_level": manifest_entry["opt_level"],
-                    }
+                    _materialize_no_l0_window_row(temp_dir, workload, manifest_entry, args)
                 if final_dir.exists() and not args.skip_existing:
                     shutil.rmtree(final_dir)
                 temp_dir.replace(final_dir)
@@ -317,9 +337,11 @@ def process_capture(
             "opt_level": manifest_entry["opt_level"],
             "workloads_created": 1,
             "windows_created": created if l0_config.enabled else 0,
+            "no_l0_window_rows_created": 1 if l0_config.enabled and created == 0 else 0,
         }
     except IngestError as exc:
         if args.skip_empty_captures and str(exc) == "no kernel_launch event":
+            remove_existing_workload_if_overwriting(args, str(capture_spec["workload"]))
             return {
                 "status": "skipped_empty",
                 "workload": str(capture_spec["workload"]),
@@ -328,6 +350,7 @@ def process_capture(
         raise CaptureBuildError(str(exc)) from exc
     except WorkloadSassError as exc:
         if args.skip_unmapped_captures and str(exc) == "no launched kernel could be mapped to disassembled SASS":
+            remove_existing_workload_if_overwriting(args, str(capture_spec["workload"]))
             return {
                 "status": "skipped_unmapped",
                 "workload": str(capture_spec["workload"]),
@@ -336,6 +359,12 @@ def process_capture(
         raise CaptureBuildError(str(exc)) from exc
     except (DisassemblyError, ValidationError) as exc:
         raise CaptureBuildError(str(exc)) from exc
+
+
+def remove_existing_workload_if_overwriting(args: argparse.Namespace, workload: str) -> None:
+    if args.skip_existing:
+        return
+    shutil.rmtree(args.output_dir / "workloads" / workload, ignore_errors=True)
 
 
 def _build_into_temp_dir(
@@ -401,9 +430,36 @@ def _build_l0_windows_from_capture(
     (workload_dir / "kernels").mkdir(parents=True, exist_ok=True)
     write_workload_manifest(workload_dir / "manifest.json", parent_workload, manifest_entry)
     launches, extraction_report = _build_capture_base(capture_dir, workload_dir, tools)
+    fragment_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
+    gate_threshold = (
+        args.l0_config_obj.trigger.bitwise_integer_ratio_threshold
+        if args.l0_config_obj.trigger.use_bitwise_gate
+        else None
+    )
+    prepared = prepare_l0_launches(
+        workload_dir,
+        launches,
+        short_kernel_threshold=args.short_kernel_threshold,
+        content_token_budget=args.l0_config_obj.window.content_token_budget,
+        fragment_cache=fragment_cache,
+        bitwise_gate_threshold=gate_threshold,
+    )
+    launches = prepared["launches"]
+    extraction_report["l0_missing_launches"] = prepared["missing_launches"]
+    extraction_report["l0_ready_launches"] = len(launches)
+    extraction_report["l0_unique_kernel_count"] = prepared.get("unique_kernel_count", 0)
+    extraction_report["l0_max_bitwise_integer_ratio"] = prepared.get("max_bitwise_integer_ratio", 0.0)
+    extraction_report["l0_gate_short_circuit"] = bool(prepared.get("gate_short_circuit", False))
     windows = build_l0_windows(launches, args.l0_config_obj)
     if not windows:
-        raise WorkloadSassError("no mature L0 windows could be built from launched kernels")
+        extraction_report["l0_windows"] = {
+            "count": 0,
+            "config_path": args.l0_config_obj.config_path,
+            "resolved_config": args.l0_config_obj.to_dict(),
+            "missing_launches": prepared["missing_launches"],
+        }
+        write_extraction_report(workload_dir, extraction_report)
+        return 0
 
     windows_dir = workload_dir / "windows"
     windows_dir.mkdir(parents=True, exist_ok=True)
@@ -419,6 +475,7 @@ def _build_l0_windows_from_capture(
                 manifest_entry,
                 window,
                 args,
+                fragment_cache,
             )
         )
         created += 1
@@ -442,12 +499,21 @@ def _materialize_l0_window(
     manifest_entry: dict[str, str],
     window: L0Window,
     args: argparse.Namespace,
+    fragment_cache: dict[tuple[str, int, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rendered = render_workload_sass(
         workload_dir,
         window.launches,
         short_kernel_threshold=args.short_kernel_threshold,
+        content_token_budget=args.l0_config_obj.window.content_token_budget,
+        fragment_cache=fragment_cache,
+        front_clip_to_budget=True,
     )
+    if int(rendered["token_cost"]) > int(args.l0_config_obj.window.content_token_budget):
+        raise WorkloadSassError(
+            f"L0 window {window.window_id} exceeds token budget: "
+            f"{rendered['token_cost']} > {args.l0_config_obj.window.content_token_budget}"
+        )
     sass_name = f"{window.window_id}.sass"
     launch_name = f"{window.window_id}.launches.jsonl"
     meta_name = f"{window.window_id}.json"
@@ -476,6 +542,11 @@ def _materialize_l0_window(
         "source_capture_path": manifest_entry.get("source_capture_path"),
         "trigger_reason": window.trigger_reason,
         "packing_mode": window.packing_mode,
+        "max_bitwise_integer_ratio": window.features.get("max_bitwise_integer_ratio"),
+        "window_token_cost": window.features.get("token_cost"),
+        "pre_clip_token_cost": window.features.get("pre_clip_token_cost"),
+        "rendered_token_cost": rendered["token_cost"],
+        "front_clipped": bool(rendered.get("front_clipped", False)),
     }
     row = {key: value for key, value in row.items() if value is not None}
 
@@ -489,9 +560,85 @@ def _materialize_l0_window(
         "launches_path": f"windows/{launch_name}",
         "missing_launches": rendered["missing_launches"],
         "included_launches": rendered["included_launches"],
+        "pre_clip_token_cost": rendered["pre_clip_token_cost"],
+        "rendered_token_cost": rendered["token_cost"],
+        "front_clipped": rendered["front_clipped"],
+        "clipped_token_count": rendered["clipped_token_count"],
     }
     write_json(windows_dir / meta_name, window_report)
     return row
+
+
+def _materialize_no_l0_window_row(
+    workload_dir: Path,
+    parent_workload: str,
+    manifest_entry: dict[str, str],
+    args: argparse.Namespace,
+) -> None:
+    windows_dir = workload_dir / "windows"
+    windows_dir.mkdir(parents=True, exist_ok=True)
+    sass_name = "no_l0_window.sass"
+    meta_name = "no_l0_window.json"
+    (windows_dir / sass_name).write_text("NO_L0_WINDOW\n", encoding="utf-8")
+
+    extraction_report_path = workload_dir / "dumps" / "extraction_report.json"
+    extraction_report = {}
+    if extraction_report_path.exists():
+        extraction_report = json.loads(extraction_report_path.read_text(encoding="utf-8"))
+    max_ratio = extraction_report.get("l0_max_bitwise_integer_ratio")
+
+    row = {
+        "workload": safe_workload_name(f"{parent_workload}__no_l0_window"),
+        "path": f"windows/{sass_name}",
+        "label": manifest_entry["label"],
+        "binary_label": manifest_entry.get(
+            "binary_label",
+            "mining" if manifest_entry["label"] == "mining_like" else "benign",
+        ),
+        "family": manifest_entry["family"],
+        "opt_level": manifest_entry["opt_level"],
+        "program": manifest_entry.get("program"),
+        "variant": manifest_entry.get("variant"),
+        "capture_id": manifest_entry.get("capture_id"),
+        "parent_workload": parent_workload,
+        "window_id": "no_l0_window",
+        "window_type": "no_l0_window",
+        "group_id": parent_workload,
+        "source_capture_path": manifest_entry.get("source_capture_path"),
+        "trigger_reason": ["no_l0_window_emitted"],
+        "packing_mode": "none",
+        "max_bitwise_integer_ratio": max_ratio,
+        "window_token_cost": 0,
+        "no_l0_window": True,
+        "default_prediction": "benign",
+        "default_prediction_reason": "no_l0_window_emitted",
+    }
+    row = {key: value for key, value in row.items() if value is not None}
+    write_jsonl(windows_dir / "manifests.jsonl", [row])
+
+    window_report = {
+        "window_id": "no_l0_window",
+        "window_type": "no_l0_window",
+        "parent_workload": parent_workload,
+        "workload": row["workload"],
+        "sass_path": f"windows/{sass_name}",
+        "config_path": args.l0_config_obj.config_path,
+        "resolved_config": args.l0_config_obj.to_dict(),
+        "no_l0_window": True,
+        "default_prediction": "benign",
+        "default_prediction_reason": "no_l0_window_emitted",
+        "max_bitwise_integer_ratio": max_ratio,
+    }
+    write_json(windows_dir / meta_name, window_report)
+
+    extraction_report["l0_no_window_row"] = {
+        "created": True,
+        "path": "windows/manifests.jsonl",
+        "default_prediction": "benign",
+        "default_prediction_reason": "no_l0_window_emitted",
+    }
+    write_extraction_report(workload_dir, extraction_report)
+    validate_l0_workload(workload_dir)
 
 
 def validate_l0_workload(workload_dir: Path) -> None:
@@ -620,9 +767,11 @@ def new_build_report() -> dict[str, Any]:
         "duplicates_skipped": 0,
         "empty_captures_skipped": 0,
         "unmapped_captures_skipped": 0,
+        "no_l0_windows_skipped": 0,
         "failed_captures": 0,
         "dry_run_ok": 0,
         "windows_created": 0,
+        "no_l0_window_rows_created": 0,
         "labels": Counter(),
         "opt_levels": Counter(),
         "failures": [],
@@ -646,9 +795,12 @@ def print_summary(report: dict[str, Any]) -> None:
     print(f"workloads created: {report['workloads_created']}")
     if report.get("windows_created"):
         print(f"windows created: {report['windows_created']}")
+    if report.get("no_l0_window_rows_created"):
+        print(f"no L0 window rows created: {report['no_l0_window_rows_created']}")
     print(f"duplicates skipped: {report['duplicates_skipped']}")
     print(f"empty captures skipped: {report['empty_captures_skipped']}")
     print(f"unmapped captures skipped: {report['unmapped_captures_skipped']}")
+    print(f"no L0 windows skipped: {report['no_l0_windows_skipped']}")
     print(f"failed captures: {report['failed_captures']}")
     if report["dry_run_ok"]:
         print(f"dry-run valid captures: {report['dry_run_ok']}")

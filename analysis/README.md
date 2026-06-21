@@ -73,3 +73,42 @@ Notes:
 - Captures whose launches cannot be mapped to disassembled SASS are skipped by default; use `--no-skip-unmapped-captures` to make those hard failures.
 - When a capture is skipped or fails during build, partial output is removed unless `--keep-partial` is set.
 - Classification splits are workload-level and grouped by optimization-pair stem, so `_o2` and `_o3` variants stay in the same split.
+
+## Online detection
+
+Online detection runs as a streaming path alongside the existing collector output:
+
+```text
+hooklib -> sassguard-collector -> online processor -> sassguard-collector -> hooklib
+```
+
+Start the Python processor first:
+
+```bash
+SASSGUARD_CAPTURE_DISABLE=1 \
+python3 -m online.sassguard_online.processor \
+  --config configs/online/detection.json
+```
+
+Set `SASSGUARD_CAPTURE_DISABLE=1` for the processor and any other trusted
+SASSGuard-side process that may load CUDA. The hook checks this environment
+variable before starting telemetry, which prevents the processor's own
+ModernBERT CUDA inference from being captured and fed back into the collector.
+The value must be present before the process loads the hook library.
+
+Then start the collector:
+
+```bash
+collector/build/sassguard-collector \
+  --config configs/online/detection.json
+```
+
+All online runtime knobs live in `configs/online/detection.json`, including the collector listen address, Unix processor socket, launch batching limits, L0 config path, ModernBERT config/checkpoint, verdict thresholds, and enforcement behavior. The processor feeds L1 only single rolling-window inputs that fit the ModernBERT sequence budget. Set `l1.devices` to a list such as `["cuda:0", "cuda:1"]` to load one inference worker per GPU, or leave it empty with `l1.device: "auto"` to use all visible CUDA devices.
+
+The collector still writes the same capture artifacts (`process.json`, `events.jsonl`, and `code/*.bin`). Online forwarding is fail-open: if the processor socket is unavailable, code analysis fails, inference fails, or queues overflow, the CUDA client keeps running and the collector continues storing captures.
+
+When a hook client disconnects or exits, the collector sends a `session_end` frame to the processor. The processor cancels queued code-analysis and inference jobs for that session, drops unsent verdicts, and discards results from any already-running inference job that finishes after the session ended.
+
+L0 launch-window rules are shared with offline dataset generation. A launch is schedulable only after its kernel has been disassembled, normalized, token-costed, and assigned an int/bitwise ratio; launches that arrive before their kernel is ready are dropped rather than deferred.
+
+When enforcement is enabled and L1 returns a mining verdict, the collector sends a control command back to hooklib. Hooklib prints the configured message and verdict details to stderr, then terminates the client process.
